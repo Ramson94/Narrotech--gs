@@ -47,7 +47,7 @@ export default function Login() {
         {/* Logo + Brand */}
         <div className="text-center mb-8">
           <div className="flex items-center justify-center mb-4">
-            <img src="/narrowtech-logo.png" alt="NarrowTech GS" className="h-16 w-auto drop-shadow-lg" />
+            <img src="./narrowtech-logo.png" alt="NarrowTech GS" className="h-16 w-auto drop-shadow-lg" />
           </div>
           <h1 className="text-2xl font-bold text-white tracking-tight">NarrowTech GS</h1>
           <p className="text-sm text-slate-400 mt-1">Crop Health Intelligence · Sentinel-2</p>

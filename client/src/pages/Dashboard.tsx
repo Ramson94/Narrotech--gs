@@ -111,7 +111,7 @@ export default function Dashboard() {
   const handleDownloadReport = async (fieldId: number, fieldName: string) => {
     setDownloadingReport(fieldId);
     try {
-      const API_BASE = ("__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__");
+      const API_BASE = ("__PORT_8000__".startsWith("__") ? "" : "__PORT_8000__");
       const res = await fetch(`${API_BASE}/api/fields/${fieldId}/report`, {
         method: "GET",
         credentials: "include",
@@ -139,7 +139,7 @@ export default function Dashboard() {
   const handleWhatsApp = async (fieldId: number, fieldName: string) => {
     setSendingWa(fieldId);
     try {
-      const API_BASE2 = ("__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__");
+      const API_BASE2 = ("__PORT_8000__".startsWith("__") ? "" : "__PORT_8000__");
       const res = await fetch(`${API_BASE2}/api/fields/${fieldId}/notify-whatsapp`, {
         method: "POST",
         credentials: "include",

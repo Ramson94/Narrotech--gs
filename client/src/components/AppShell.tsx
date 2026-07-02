@@ -66,7 +66,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       {/* Brand */}
       <div className="flex items-center gap-3 px-4 py-4 border-b border-sidebar-border">
         <img
-          src="/narrowtech-logo.png"
+          src="./narrowtech-logo.png"
           alt="NarrowTech GeoSolution Logo"
           className="w-10 h-10 object-contain rounded flex-shrink-0 bg-white p-0.5"
         />

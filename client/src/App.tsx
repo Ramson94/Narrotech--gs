@@ -32,7 +32,7 @@ function AppRoutes() {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-[#0f2a3f] via-[#1a3a52] to-[#0d2233]">
         <div className="flex flex-col items-center gap-3">
-          <img src="/narrowtech-logo.png" alt="NarrowTech GS" className="h-14 w-auto animate-pulse" />
+          <img src="./narrowtech-logo.png" alt="NarrowTech GS" className="h-14 w-auto animate-pulse" />
           <p className="text-slate-400 text-sm">Loading…</p>
         </div>
       </div>
