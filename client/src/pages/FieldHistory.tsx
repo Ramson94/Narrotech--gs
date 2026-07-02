@@ -11,7 +11,7 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as ChartTooltip,
   ResponsiveContainer, ReferenceLine, Legend
 } from "recharts";
-import { Leaf, Droplets, Calendar, RefreshCw, Trash2, MapPin, TrendingUp, TrendingDown } from "lucide-react";
+import { Leaf, Droplets, Calendar, RefreshCw, Trash2, MapPin, TrendingUp, TrendingDown, Sprout } from "lucide-react";
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger
@@ -208,7 +208,7 @@ export default function FieldHistory() {
                   </CardHeader>
                   <CardContent className="space-y-4">
                     {/* Key metrics */}
-                    <div className="grid grid-cols-3 gap-3">
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                       <div className="text-center p-3 rounded-lg bg-muted/40">
                         <p className="text-xs text-muted-foreground mb-1 flex items-center justify-center gap-1">
                           <Leaf size={11} /> NDVI
@@ -226,6 +226,15 @@ export default function FieldHistory() {
                           {selected.ndwi?.toFixed(3) ?? "—"}
                         </p>
                         <p className="text-xs text-muted-foreground">{selected.ndwi !== null ? (selected.ndwi! > 0 ? "Adequate moisture" : selected.ndwi! > -0.2 ? "Mild stress" : "Water stressed") : ""}</p>
+                      </div>
+                      <div className="text-center p-3 rounded-lg bg-muted/40">
+                        <p className="text-xs text-muted-foreground mb-1 flex items-center justify-center gap-1">
+                          <Sprout size={11} /> EVI
+                        </p>
+                        <p className="text-xl font-bold font-mono text-foreground">
+                          {selected.evi?.toFixed(3) ?? "—"}
+                        </p>
+                        <p className="text-xs text-muted-foreground">{selected.evi !== null && selected.evi !== undefined ? (selected.evi! >= 0.35 ? "Good vigor" : selected.evi! >= 0.2 ? "Moderate" : "Sparse") : ""}</p>
                       </div>
                       <div className="text-center p-3 rounded-lg bg-muted/40">
                         <p className="text-xs text-muted-foreground mb-1">Health Score</p>

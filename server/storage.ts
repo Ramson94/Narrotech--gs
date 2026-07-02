@@ -19,6 +19,7 @@ sqlite.exec(`
     coordinates TEXT NOT NULL,
     ndvi REAL,
     ndwi REAL,
+    evi REAL,
     health_score INTEGER,
     status TEXT DEFAULT 'pending',
     time_series_data TEXT,
@@ -65,6 +66,7 @@ const migrateColumns = [
   "ALTER TABLE fields ADD COLUMN cloud_cover_max INTEGER DEFAULT 20",
   "ALTER TABLE fields ADD COLUMN last_notified_at TEXT",
   "ALTER TABLE fields ADD COLUMN notifications_enabled INTEGER DEFAULT 1",
+  "ALTER TABLE fields ADD COLUMN evi REAL",
 ];
 for (const stmt of migrateColumns) {
   try { sqlite.exec(stmt); } catch (_) { /* column already exists — safe to ignore */ }

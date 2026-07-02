@@ -102,6 +102,20 @@ function classifyNdvi(ndvi: number) {
   return "Critical";
 }
 
+/**
+ * Classify a pixel based on EVI (Enhanced Vegetation Index).
+ * EVI = 2.5 * (NIR-Red) / (NIR + 6*Red - 7.5*Blue + 1)
+ * EVI improves on NDVI by correcting for atmospheric and soil-background
+ * effects and reducing saturation over dense canopy.
+ */
+function classifyEvi(evi: number) {
+  if (evi >= 0.5) return "Excellent";
+  if (evi >= 0.35) return "Good";
+  if (evi >= 0.2) return "Moderate";
+  if (evi >= 0.1) return "Poor";
+  return "Critical";
+}
+
 // ─── SentinelHub real API call ─────────────────────────────────────────────
 // ─── Helper: generate bi-weekly date windows between two dates ────────────
 function biweeklyWindows(dateFrom: string, dateTo: string): { from: string; to: string; mid: string }[] {
@@ -134,17 +148,18 @@ async function fetchOneWindow(
   winFrom: string,
   winTo: string,
   cloudCoverMax: number
-): Promise<{ ndvi: number | null; msi: number | null; cloudCover: number; noData: boolean }> {
+): Promise<{ ndvi: number | null; msi: number | null; evi: number | null; cloudCover: number; noData: boolean }> {
 
   // Build evalscript as array-join to avoid template literal serialization issues with esbuild
   const evalscript = [
     "//VERSION=3",
     "function setup() {",
     "  return {",
-    "    input: [{ bands: ['B04','B08','B8A','B11','SCL'] }],",
+    "    input: [{ bands: ['B02','B04','B08','B8A','B11','SCL'] }],",
     "    output: [",
     "      { id: 'ndvi',     bands: 1, sampleType: 'FLOAT32' },",
     "      { id: 'msi',      bands: 1, sampleType: 'FLOAT32' },",
+    "      { id: 'evi',      bands: 1, sampleType: 'FLOAT32' },",
     "      { id: 'dataMask', bands: 1, sampleType: 'UINT8'   }",
     "    ],",
     "    mosaicking: 'SIMPLE'",
@@ -152,11 +167,13 @@ async function fetchOneWindow(
     "}",
     "function evaluatePixel(s) {",
     "  var scl = s.SCL;",
-    "  if ([8,9,10,3].includes(scl) || scl === 6) return { ndvi:[0], msi:[0], dataMask:[0] };",
-    "  var n=s.B08, r=s.B04, nir8a=s.B8A, sw=s.B11;",
+    "  if ([8,9,10,3].includes(scl) || scl === 6) return { ndvi:[0], msi:[0], evi:[0], dataMask:[0] };",
+    "  var n=s.B08, r=s.B04, nir8a=s.B8A, sw=s.B11, b=s.B02;",
     "  var d1=n+r, d2=nir8a;",
-    "  if (d1 < 0.01 || d2 < 0.01) return { ndvi:[0], msi:[0], dataMask:[0] };",
-    "  return { ndvi:[(n-r)/d1], msi:[sw/d2], dataMask:[1] };",
+    "  if (d1 < 0.01 || d2 < 0.01) return { ndvi:[0], msi:[0], evi:[0], dataMask:[0] };",
+    "  var eviDen = n + 6*r - 7.5*b + 1;",
+    "  var evi = Math.abs(eviDen) < 0.01 ? 0 : 2.5*(n-r)/eviDen;",
+    "  return { ndvi:[(n-r)/d1], msi:[sw/d2], evi:[evi], dataMask:[1] };",
     "}"
   ].join("\n");
 
@@ -179,7 +196,8 @@ async function fetchOneWindow(
     },
     calculations: {
       ndvi: { statistics: { default: {} } },
-      msi:  { statistics: { default: {} } }
+      msi:  { statistics: { default: {} } },
+      evi:  { statistics: { default: {} } }
     }
   };
 
@@ -201,24 +219,26 @@ async function fetchOneWindow(
     if (!res.ok) {
       const errText = await res.text();
       console.warn("Stats API error:", res.status, errText.slice(0, 400));
-      return { ndvi: null, msi: null, cloudCover: 100, noData: true };
+      return { ndvi: null, msi: null, evi: null, cloudCover: 100, noData: true };
     }
     const json = await res.json();
     const intervals: any[] = json?.data || [];
-    if (!intervals.length) return { ndvi: null, msi: null, cloudCover: 100, noData: true };
+    if (!intervals.length) return { ndvi: null, msi: null, evi: null, cloudCover: 100, noData: true };
 
     // Pick the best daily observation: highest valid-pixel ratio, sensible NDVI
-    let best: { ndvi: number; msi: number | null; cloudCover: number } | null = null;
+    let best: { ndvi: number; msi: number | null; evi: number | null; cloudCover: number } | null = null;
     let bestValidRatio = -1;
 
     for (const iv of intervals) {
       const ns = iv?.outputs?.ndvi?.bands?.B0?.stats;
       const ms = iv?.outputs?.msi?.bands?.B0?.stats;
+      const es = iv?.outputs?.evi?.bands?.B0?.stats;
       if (!ns || ns.sampleCount === 0) continue;
       const validRatio = 1 - (ns.noDataCount / ns.sampleCount);
       if (validRatio < 0.05) continue;  // less than 5% valid pixels — skip
       const ndviMean = ns.mean;
       const msiMean  = ms?.mean ?? null;
+      const eviMean  = es?.mean ?? null;
       if (typeof ndviMean !== "number" || ndviMean < -1.5 || ndviMean > 1.5) continue;
       if (validRatio > bestValidRatio) {
         bestValidRatio = validRatio;
@@ -226,17 +246,19 @@ async function fetchOneWindow(
           ndvi: Math.round(ndviMean * 1000) / 1000,
           msi:  (typeof msiMean === "number" && msiMean > 0.05 && msiMean < 10)
                 ? Math.round(msiMean * 1000) / 1000 : null,
+          evi:  (typeof eviMean === "number" && eviMean > -1.5 && eviMean < 1.5)
+                ? Math.round(eviMean * 1000) / 1000 : null,
           cloudCover: Math.round((1 - validRatio) * 100)
         };
       }
     }
 
-    if (!best) return { ndvi: null, msi: null, cloudCover: 100, noData: true };
+    if (!best) return { ndvi: null, msi: null, evi: null, cloudCover: 100, noData: true };
     return { ...best, noData: false };
 
   } catch (err) {
     console.warn("Stats API window fetch error:", err);
-    return { ndvi: null, msi: null, cloudCover: 100, noData: true };
+    return { ndvi: null, msi: null, evi: null, cloudCover: 100, noData: true };
   }
 }
 
@@ -246,7 +268,7 @@ async function fetchSentinelHubData(
   dateFrom: string,
   dateTo: string,
   cloudCoverMax: number
-): Promise<{ ndvi: number; ndwi: number; cloudCover: number; isWater: boolean; date: string; dataSource: string }[]> {
+): Promise<{ ndvi: number; ndwi: number; evi: number | null; cloudCover: number; isWater: boolean; date: string; dataSource: string }[]> {
 
   const token = await getSentinelToken();
   if (!token) {
@@ -277,7 +299,7 @@ async function fetchSentinelHubData(
     })
   );
 
-  const results: { ndvi: number; ndwi: number; cloudCover: number; isWater: boolean; date: string; dataSource: string }[] = [];
+  const results: { ndvi: number; ndwi: number; evi: number | null; cloudCover: number; isWater: boolean; date: string; dataSource: string }[] = [];
   let realDataCount = 0;
 
   for (const { win, result } of windowResults) {
@@ -296,6 +318,7 @@ async function fetchSentinelHubData(
         date: win.mid,
         ndvi: result.ndvi,
         ndwi: msiVal,
+        evi: result.evi ?? null,
         cloudCover: result.cloudCover,
         isWater,
         dataSource: source
@@ -349,11 +372,17 @@ function simulateTimeSeries(
     // If cloud cover > threshold, mark as cloud-contaminated
     const cloudOk = cloudCover <= 20;
 
+    // EVI correlates with NDVI but has reduced saturation over dense canopy —
+    // approximate as a damped, slightly noisy function of NDVI for simulation.
+    const rngEvi = Math.abs(Math.sin(seed * (t * 100 + 3) * 9.1));
+    const rawEvi = Math.max(-1, Math.min(1, ndvi * 0.85 + (rngEvi - 0.5) * 0.08));
+
     if (!isWater && cloudOk) {
       results.push({
         date: current.toISOString().split("T")[0],
         ndvi: Math.round(ndvi * 1000) / 1000,
         ndwi: Math.round(rawNdwi * 1000) / 1000,
+        evi: Math.round(rawEvi * 1000) / 1000,
         cloudCover,
         isWater: false,
         dataSource: "Simulated (no API key)"
@@ -364,6 +393,7 @@ function simulateTimeSeries(
         date: current.toISOString().split("T")[0],
         ndvi: null,
         ndwi: null,
+        evi: null,
         cloudCover,
         isWater: false,
         dataSource: "Cloudy — excluded",
@@ -379,11 +409,12 @@ function simulateTimeSeries(
 // ─── Compute aggregated metrics from time-series data ──────────────────────
 function computeAggregates(timeSeriesData: any[]) {
   const valid = timeSeriesData.filter(d => !d.excluded && !d.isWater && d.ndvi !== null);
-  if (valid.length === 0) return { ndvi: null, ndwi: null, healthScore: null };
+  if (valid.length === 0) return { ndvi: null, ndwi: null, evi: null, healthScore: null };
   const latest = valid[valid.length - 1];
   const ndvi = latest.ndvi;
   const ndwi = latest.ndwi;
-  // Health score: NDVI 70% + NDWI adequacy 30%
+  const evi = latest.evi ?? null;
+  // Health score: NDVI 70% + NDWI adequacy 30% (unchanged — EVI is supplementary/displayed only)
   const ndviScore = Math.max(0, ((ndvi - 0.05) / 0.9)) * 100;
   // MSI score: lower MSI = better moisture. Invert for health score.
   // MSI < 0.4 = excellent, 0.4-0.6 = good, 0.6-1.0 = ok, 1.0-1.2 = poor, >1.2 = critical
@@ -391,11 +422,11 @@ function computeAggregates(timeSeriesData: any[]) {
     ? (ndwi < 0.4 ? 95 : ndwi < 0.6 ? 80 : ndwi < 1.0 ? 60 : ndwi < 1.2 ? 35 : 10)
     : 50;
   const healthScore = Math.round(Math.max(0, Math.min(100, ndviScore * 0.7 + ndwiScore * 0.3)));
-  return { ndvi, ndwi, healthScore };
+  return { ndvi, ndwi, evi, healthScore };
 }
 
 // ─── Alert generation ──────────────────────────────────────────────────────
-function generateAlerts(fieldId: number, ndvi: number | null, ndwi: number | null, fieldName: string) {
+function generateAlerts(fieldId: number, ndvi: number | null, ndwi: number | null, fieldName: string, evi?: number | null) {
   const now = new Date().toISOString();
   const list: any[] = [];
   if (ndvi === null) return list;
@@ -415,6 +446,10 @@ function generateAlerts(fieldId: number, ndvi: number | null, ndwi: number | nul
       list.push({ fieldId, type: "water_stress", severity: "warning", createdAt: now,
         message: `${fieldName}: Moderate water stress detected (MSI ${ndwi.toFixed(3)}). Consider supplemental irrigation.` });
     }
+  }
+  if (typeof evi === "number" && evi < 0.1) {
+    list.push({ fieldId, type: "evi_critical", severity: "warning", createdAt: now,
+      message: `${fieldName}: EVI critically low (${evi.toFixed(3)}), corroborating weak canopy vigor.` });
   }
   if (ndvi > 0.7 && ndwi !== null && ndwi < 0.6) {
     list.push({ fieldId, type: "optimal", severity: "info", createdAt: now,
@@ -480,11 +515,12 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
     const coords = JSON.parse(field.coordinates);
     const timeSeriesData = await fetchSentinelHubData(coords, dateFrom, dateTo, cloudCoverMax);
-    const { ndvi, ndwi, healthScore } = computeAggregates(timeSeriesData);
+    const { ndvi, ndwi, evi, healthScore } = computeAggregates(timeSeriesData);
 
     const updated = storage.updateField(field.id, {
       ndvi: ndvi ?? undefined,
       ndwi: ndwi ?? undefined,
+      evi: evi ?? undefined,
       healthScore: healthScore ?? undefined,
       status: healthScore !== null ? (healthScore < 40 ? "alert" : "analyzed") : "analyzed",
       timeSeriesData: JSON.stringify(timeSeriesData),
@@ -497,7 +533,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
     // Generate alerts (only if bi-weekly is due)
     const notifyDue = isBiweeklyDue(field.lastNotifiedAt ?? null);
     storage.deleteAlertsByField(field.id);
-    const newAlerts = generateAlerts(field.id, ndvi, ndwi, field.name);
+    const newAlerts = generateAlerts(field.id, ndvi, ndwi, field.name, evi);
     newAlerts.forEach(a => storage.createAlert(a));
 
     if (notifyDue) {
@@ -556,14 +592,14 @@ export function registerRoutes(httpServer: Server, app: Express) {
       const dateFrom = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
       const dateTo = new Date().toISOString().split("T")[0];
       const ts = await fetchSentinelHubData(coords, dateFrom, dateTo, field.cloudCoverMax ?? 20);
-      const { ndvi, ndwi, healthScore } = computeAggregates(ts);
+      const { ndvi, ndwi, evi, healthScore } = computeAggregates(ts);
       storage.deleteAlertsByField(field.id);
-      generateAlerts(field.id, ndvi, ndwi, field.name).forEach(a => storage.createAlert(a));
+      generateAlerts(field.id, ndvi, ndwi, field.name, evi).forEach(a => storage.createAlert(a));
       storage.updateField(field.id, {
-        ndvi: ndvi ?? undefined, ndwi: ndwi ?? undefined, healthScore: healthScore ?? undefined,
+        ndvi: ndvi ?? undefined, ndwi: ndwi ?? undefined, evi: evi ?? undefined, healthScore: healthScore ?? undefined,
         timeSeriesData: JSON.stringify(ts), lastNotifiedAt: new Date().toISOString()
       });
-      results.push({ fieldId: field.id, name: field.name, ndvi, ndwi });
+      results.push({ fieldId: field.id, name: field.name, ndvi, ndwi, evi });
     }
     res.json({ checked: due.length, results });
   });
@@ -613,9 +649,10 @@ export function registerRoutes(httpServer: Server, app: Express) {
       // Choose evalscript based on requested index
       // NDVI: green → yellow → red colour ramp
       // MSI:  blue (moist) → yellow → red (stressed) ramp (inverted because MSI increases with stress)
-      const isNdvi = type === "ndvi";
-      const evalscript = isNdvi
-        ? [
+      // EVI:  purple/red (low) → yellow → green (high) — distinct ramp from NDVI
+      let evalscript: string;
+      if (type === "ndvi") {
+        evalscript = [
             "//VERSION=3",
             "function setup(){return{input:[{bands:['B04','B08','SCL']}],output:{bands:3}};}",
             "function evaluatePixel(s){",
@@ -627,8 +664,25 @@ export function registerRoutes(httpServer: Server, app: Express) {
             "  if(v<0.66)return[0.8-v*0.4, 0.7+v*0.3, 0.05];",     // yellow (moderate)
             "  return[0.05, 0.4+v*0.5, 0.1];",                       // green (high NDVI)
             "}"
-          ].join("\n")
-        : [
+          ].join("\n");
+      } else if (type === "evi") {
+        evalscript = [
+            "//VERSION=3",
+            "function setup(){return{input:[{bands:['B02','B04','B08','SCL']}],output:{bands:3}};}",
+            "function evaluatePixel(s){",
+            "  if([8,9,10].includes(s.SCL))return[0.6,0.6,0.7];",   // cloud → grey
+            "  if(s.SCL===6)return[0.1,0.3,0.7];",                   // water → blue
+            "  var n=s.B08, r=s.B04, b=s.B02;",
+            "  var den=n+6*r-7.5*b+1;",
+            "  var evi=Math.abs(den)<0.01?0:2.5*(n-r)/den;",
+            "  var v=Math.max(0,Math.min(1,(evi+0.2)/0.9));",
+            "  if(v<0.33)return[0.55+v*0.3, 0.05, 0.55-v*0.3];",    // purple-magenta (low EVI)
+            "  if(v<0.66)return[0.85-v*0.3, 0.75+v*0.2, 0.05];",    // yellow-orange (moderate)
+            "  return[0.05, 0.35+v*0.55, 0.15];",                    // green (high EVI)
+            "}"
+          ].join("\n");
+      } else {
+        evalscript = [
             "//VERSION=3",
             "function setup(){return{input:[{bands:['B8A','B11','SCL']}],output:{bands:3}};}",
             "function evaluatePixel(s){",
@@ -641,6 +695,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
             "  return[0.9,0.1,0.05];",                               // red (stressed)
             "}"
           ].join("\n");
+      }
 
       const body = {
         input: {

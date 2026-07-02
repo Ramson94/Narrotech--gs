@@ -197,6 +197,7 @@ export default function Alerts() {
               { icon: XCircle, color: "text-red-500", label: "Critical: MSI > 1.2", desc: "Severe drought stress — immediate irrigation needed" },
               { icon: AlertTriangle, color: "text-yellow-500", label: "Warning: NDVI 0.2–0.35", desc: "Low vegetation density, check for pest/nutrient stress" },
               { icon: AlertTriangle, color: "text-yellow-500", label: "Warning: MSI 1.0–1.2", desc: "Moderate water stress — consider irrigation" },
+              { icon: AlertTriangle, color: "text-yellow-500", label: "Warning: EVI < 0.1", desc: "Critically low canopy vigor — possible crop stress or bare soil" },
               { icon: Info, color: "text-blue-500", label: "Info: NDVI > 0.7 + MSI < 0.6", desc: "Excellent crop health — good moisture status" },
             ].map(({ icon: Icon, color, label, desc }) => (
               <div key={label} className="flex items-start gap-2">

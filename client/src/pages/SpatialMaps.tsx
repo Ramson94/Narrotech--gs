@@ -55,6 +55,28 @@ function MsiLegend() {
   );
 }
 
+function EviLegend() {
+  return (
+    <div className="flex items-center gap-2 flex-wrap text-xs text-muted-foreground mt-2">
+      <span className="font-medium text-foreground">EVI:</span>
+      {[
+        { color: "#9b1a8a", label: "Critical (<0.1)" },
+        { color: "#d1479e", label: "Poor (0.1–0.2)" },
+        { color: "#e8c400", label: "Moderate (0.2–0.35)" },
+        { color: "#7ec93d", label: "Good (0.35–0.5)" },
+        { color: "#1a8f3d", label: "Excellent (>0.5)" },
+        { color: "#1a4db3", label: "Water" },
+        { color: "#9aa0b0", label: "Cloud" },
+      ].map(({ color, label }) => (
+        <span key={label} className="flex items-center gap-1">
+          <span className="inline-block w-3 h-3 rounded-sm flex-shrink-0" style={{ background: color }} />
+          {label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 // ── Project lat/lng polygon onto 0..1 image space given a bbox ──────────────
 const BUF = 0.005; // must match server-side buffer
 function projectPolygon(
@@ -170,7 +192,7 @@ async function downloadMapPng(
     ctx.fillRect(0, 0, SIZE, SIZE + HEADER + FOOTER);
 
     // Header text
-    const indexLabel = type === "ndvi" ? "NDVI — Vegetation Index" : "MSI — Moisture Stress Index";
+    const indexLabel = type === "ndvi" ? "NDVI — Vegetation Index" : type === "evi" ? "EVI — Enhanced Vegetation Index" : "MSI — Moisture Stress Index";
     ctx.fillStyle = "#f8fafc";
     ctx.font = "bold 14px system-ui, sans-serif";
     ctx.fillText(fieldName, 16, 20);
@@ -287,7 +309,7 @@ function MapTile({
 }: {
   fieldId: number;
   date: string;
-  type: "ndvi" | "msi";
+  type: "ndvi" | "msi" | "evi";
   label: string;
   coords: { lat: number; lng: number }[];
   fieldName: string;
@@ -387,7 +409,7 @@ function MapTile({
           />
         )}
 
-        {type === "ndvi" ? <NdviLegend /> : <MsiLegend />}
+        {type === "ndvi" ? <NdviLegend /> : type === "evi" ? <EviLegend /> : <MsiLegend />}
       </div>
 
       {/* Zoom modal — shows full unclipped image + clipped side by side */}
@@ -441,7 +463,7 @@ function MapTile({
               </div>
             </div>
             <div className="mt-3">
-              {type === "ndvi" ? <NdviLegend /> : <MsiLegend />}
+              {type === "ndvi" ? <NdviLegend /> : type === "evi" ? <EviLegend /> : <MsiLegend />}
             </div>
           </div>
         </div>
@@ -466,9 +488,10 @@ function DateRow({
         <span className="text-sm font-semibold text-foreground">{date}</span>
         <Badge variant="outline" className="text-xs">Bi-weekly observation</Badge>
       </div>
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
         <MapTile fieldId={fieldId} date={date} type="ndvi" label="NDVI — Vegetation Index" coords={coords} fieldName={fieldName} />
         <MapTile fieldId={fieldId} date={date} type="msi"  label="MSI — Moisture Stress"   coords={coords} fieldName={fieldName} />
+        <MapTile fieldId={fieldId} date={date} type="evi"  label="EVI — Enhanced Vegetation" coords={coords} fieldName={fieldName} />
       </div>
     </div>
   );
@@ -508,7 +531,7 @@ export default function SpatialMaps() {
             Spatial Maps
           </h2>
           <p className="text-sm text-muted-foreground mt-0.5">
-            Bi-weekly NDVI and Moisture Stress Index maps from Sentinel-2 — see spatial variation across your field.
+            Bi-weekly NDVI, MSI and EVI maps from Sentinel-2 — see spatial variation across your field.
             Download or share any map as a PNG image.
           </p>
         </div>

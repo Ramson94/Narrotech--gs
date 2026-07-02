@@ -82,18 +82,19 @@ function getDefaultDates() {
 // ── Download helpers ──────────────────────────────────────────────────────────
 
 function downloadCSV(data: any[], fieldName: string, dateFrom: string, dateTo: string) {
-  const headers = ["Date", "NDVI", "MSI", "Cloud Cover (%)", "Status", "Data Source"];
+  const headers = ["Date", "NDVI", "MSI", "EVI", "Cloud Cover (%)", "Status", "Data Source"];
   const rows = [...data].reverse().map(d => [
     d.date,
     d.NDVI !== null && d.NDVI !== undefined ? d.NDVI.toFixed(3) : "",
     d.MSI !== null && d.MSI !== undefined ? d.MSI.toFixed(3) : "",
+    d.EVI !== null && d.EVI !== undefined ? d.EVI.toFixed(3) : "",
     d.cloudCover ?? "",
     d.excluded ? "Cloudy-excluded" : d.isWater ? "Open water-removed" : "Valid",
     d.dataSource ?? "",
   ]);
 
   const metaLines = [
-    `# NarrowTech GS — NDVI & MSI Time Series`,
+    `# NarrowTech GS — NDVI, MSI & EVI Time Series`,
     `# Field: ${fieldName}`,
     `# Period: ${dateFrom} to ${dateTo}`,
     `# Generated: ${new Date().toISOString()}`,
@@ -289,6 +290,7 @@ export default function TimeSeries() {
     date: d.date,
     NDVI: d.excluded || d.isWater ? null : d.ndvi,
     MSI: d.excluded || d.isWater ? null : d.ndwi,
+    EVI: d.excluded || d.isWater ? null : (d.evi ?? null),
     cloudCover: d.cloudCover,
     excluded: d.excluded,
     isWater: d.isWater,
@@ -317,7 +319,7 @@ export default function TimeSeries() {
   return (
     <div className="max-w-6xl space-y-5">
       <div>
-        <h2 className="text-xl font-bold text-foreground">NDVI & MSI Time Series</h2>
+        <h2 className="text-xl font-bold text-foreground">NDVI, MSI & EVI Time Series</h2>
         <p className="text-sm text-muted-foreground mt-0.5">
           Plot vegetation health and water stress over time using Sentinel-2 bi-weekly passes.
           Open water pixels are automatically excluded from stress analysis.
@@ -482,7 +484,7 @@ export default function TimeSeries() {
           <div className="flex items-start justify-between gap-4 flex-wrap">
             <div>
               <CardTitle className="text-base">
-                NDVI & MSI Time Series
+                NDVI, MSI & EVI Time Series
                 {selectedField && <span className="text-muted-foreground font-normal ml-2">— {selectedField.name}</span>}
               </CardTitle>
               <CardDescription className="text-xs mt-1">
@@ -493,6 +495,7 @@ export default function TimeSeries() {
               <div className="flex items-center gap-3 text-xs">
                 <span className="flex items-center gap-1.5"><span className="w-3 h-1 rounded bg-emerald-500 inline-block" />NDVI</span>
                 <span className="flex items-center gap-1.5"><span className="w-3 h-1 rounded bg-blue-500 inline-block" />MSI</span>
+                <span className="flex items-center gap-1.5"><span className="w-3 h-1 rounded bg-purple-500 inline-block" />EVI</span>
                 <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-orange-400 inline-block" />Cloudy</span>
                 <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-blue-400 inline-block" />Water</span>
               </div>
@@ -581,6 +584,19 @@ export default function TimeSeries() {
                     name="MSI"
                     strokeDasharray="none"
                   />
+
+                  {/* EVI line — purple */}
+                  <Line
+                    type="monotone"
+                    dataKey="EVI"
+                    stroke="#a855f7"
+                    strokeWidth={2.5}
+                    dot={{ fill: "#a855f7", r: 3, strokeWidth: 0 }}
+                    activeDot={{ r: 5, fill: "#a855f7" }}
+                    connectNulls={false}
+                    name="EVI"
+                    strokeDasharray="5 2"
+                  />
                 </ComposedChart>
               </ResponsiveContainer>
             </div>
@@ -622,6 +638,7 @@ export default function TimeSeries() {
                     <th className="text-left py-2 pr-4 text-muted-foreground font-medium">Date</th>
                     <th className="text-right py-2 pr-4 text-muted-foreground font-medium">NDVI</th>
                     <th className="text-right py-2 pr-4 text-muted-foreground font-medium">MSI</th>
+                    <th className="text-right py-2 pr-4 text-muted-foreground font-medium">EVI</th>
                     <th className="text-right py-2 pr-4 text-muted-foreground font-medium">Cloud %</th>
                     <th className="text-left py-2 text-muted-foreground font-medium">Status</th>
                   </tr>
@@ -635,6 +652,9 @@ export default function TimeSeries() {
                       </td>
                       <td className="py-1.5 pr-4 text-right font-mono text-blue-600 dark:text-blue-400">
                         {d.MSI !== null && d.MSI !== undefined ? d.MSI.toFixed(3) : "—"}
+                      </td>
+                      <td className="py-1.5 pr-4 text-right font-mono text-purple-600 dark:text-purple-400">
+                        {d.EVI !== null && d.EVI !== undefined ? d.EVI.toFixed(3) : "—"}
                       </td>
                       <td className="py-1.5 pr-4 text-right">
                         <span className={d.cloudCover > cloudCoverMax ? "text-orange-500 font-semibold" : "text-muted-foreground"}>
@@ -660,7 +680,7 @@ export default function TimeSeries() {
       )}
 
       {/* Legend cards */}
-      <div className="grid sm:grid-cols-2 gap-4">
+      <div className="grid sm:grid-cols-3 gap-4">
         <Card className="bg-emerald-50 dark:bg-emerald-950/20 border-emerald-200 dark:border-emerald-900/40">
           <CardContent className="p-4 space-y-2">
             <p className="text-xs font-semibold text-emerald-700 dark:text-emerald-400 flex items-center gap-1.5">
@@ -692,6 +712,25 @@ export default function TimeSeries() {
               ["0.6–1.0", "Mild water stress", "text-yellow-600 dark:text-yellow-400"],
               ["1.0–1.2", "Moderate drought", "text-orange-600 dark:text-orange-400"],
               ["> 1.2", "Severe drought stress", "text-red-600 dark:text-red-400"],
+            ].map(([range, label, cls]) => (
+              <div key={range} className="flex justify-between text-xs">
+                <span className={`font-mono font-medium ${cls}`}>{range}</span>
+                <span className="text-muted-foreground">{label}</span>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+        <Card className="bg-purple-50 dark:bg-purple-950/20 border-purple-200 dark:border-purple-900/40">
+          <CardContent className="p-4 space-y-2">
+            <p className="text-xs font-semibold text-purple-700 dark:text-purple-400 flex items-center gap-1.5">
+              <Leaf size={12} /> EVI Reference Ranges
+            </p>
+            {[
+              ["≥ 0.5", "Dense healthy canopy", "text-green-700 dark:text-green-400"],
+              ["0.35–0.5", "Good vegetation vigor", "text-emerald-600 dark:text-emerald-400"],
+              ["0.2–0.35", "Moderate / developing", "text-yellow-600 dark:text-yellow-400"],
+              ["0.1–0.2", "Poor / sparse canopy", "text-orange-600 dark:text-orange-400"],
+              ["< 0.1", "Critical / bare soil", "text-red-600 dark:text-red-400"],
             ].map(([range, label, cls]) => (
               <div key={range} className="flex justify-between text-xs">
                 <span className={`font-mono font-medium ${cls}`}>{range}</span>

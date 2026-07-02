@@ -11,9 +11,10 @@ export const fields = sqliteTable("fields", {
   coordinates: text("coordinates").notNull(),
   ndvi: real("ndvi"),
   ndwi: real("ndwi"),
+  evi: real("evi"),
   healthScore: integer("health_score"),
   status: text("status").default("pending"), // pending, analyzed, alert
-  // JSON array of {date, ndvi, ndwi, cloudCover, isWater, dataSource}
+  // JSON array of {date, ndvi, ndwi, evi, cloudCover, isWater, dataSource}
   timeSeriesData: text("time_series_data"),
   // Date range used for last analysis
   dateFrom: text("date_from"),

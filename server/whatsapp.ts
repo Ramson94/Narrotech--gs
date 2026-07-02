@@ -36,6 +36,15 @@ function msiLabel(v: number | null): string {
   return "SEVERE DROUGHT 🔴";
 }
 
+function eviLabel(v: number | null | undefined): string {
+  if (v === null || v === undefined) return "Unknown";
+  if (v >= 0.5)  return "Excellent ✅";
+  if (v >= 0.35) return "Good ✅";
+  if (v >= 0.2)  return "Moderate ⚠️";
+  if (v >= 0.1)  return "Poor ⚠️";
+  return "Critical 🔴";
+}
+
 function recommendation(field: Field): string {
   const msi  = field.ndwi ?? 0;
   const ndvi = field.ndvi ?? 0;
@@ -60,6 +69,7 @@ export function buildWhatsAppMessage(field: Field, alerts: Alert[]): string {
   lines.push("📊 *Satellite Results (Sentinel-2)*");
   lines.push(`• NDVI: ${field.ndvi !== null ? (field.ndvi ?? 0).toFixed(3) : "—"}  →  ${ndviLabel(field.ndvi ?? null)}`);
   lines.push(`• MSI:  ${field.ndwi !== null ? (field.ndwi ?? 0).toFixed(3) : "—"}  →  ${msiLabel(field.ndwi ?? null)}`);
+  lines.push(`• EVI:  ${field.evi !== null && field.evi !== undefined ? field.evi.toFixed(3) : "—"}  →  ${eviLabel(field.evi ?? null)}`);
   lines.push(`• Health Score: ${field.healthScore ?? "—"}/100`);
   lines.push("");
 
