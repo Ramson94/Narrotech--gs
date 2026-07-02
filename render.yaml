@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: narrowtech-gs
+    runtime: node
+    region: oregon
+    plan: free
+    buildCommand: npm ci --legacy-peer-deps && npm run build
+    startCommand: NODE_ENV=production node dist/index.cjs
+    healthCheckPath: /api/ping
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5000
+      - key: META_WA_TOKEN
+        sync: false
+      - key: META_WA_PHONE_ID
+        value: 1161769453684922
+      - key: WHATSAPP_NOTIFY_TO
+        value: 972552875338
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: COPERNICUS_USER_ID
+        value: sh-cd0256f9-1e8d-4ba4-9cc6-b7d068c13401
+      - key: COPERNICUS_ACCOUNT_ID
+        sync: false
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1

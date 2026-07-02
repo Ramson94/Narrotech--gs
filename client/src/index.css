@@ -1,0 +1,96 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* NarrowTech GeoSolution Brand Palette — Blue + Green + Gold */
+    --background: 210 20% 98%;
+    --foreground: 215 30% 12%;
+    --card: 0 0% 100%;
+    --card-foreground: 215 30% 12%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 215 30% 12%;
+    --primary: 207 70% 38%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 110 35% 92%;
+    --secondary-foreground: 110 40% 20%;
+    --muted: 210 15% 93%;
+    --muted-foreground: 215 12% 46%;
+    --accent: 38 92% 55%;
+    --accent-foreground: 215 30% 12%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 210 15% 85%;
+    --input: 210 15% 85%;
+    --ring: 207 70% 38%;
+    --radius: 0.5rem;
+    --sidebar-background: 215 35% 15%;
+    --sidebar-foreground: 210 25% 94%;
+    --sidebar-primary: 110 48% 52%;
+    --sidebar-primary-foreground: 215 35% 10%;
+    --sidebar-accent: 215 30% 22%;
+    --sidebar-accent-foreground: 210 25% 94%;
+    --sidebar-border: 215 25% 24%;
+    --sidebar-ring: 110 48% 52%;
+  }
+
+  .dark {
+    --background: 215 30% 8%;
+    --foreground: 210 20% 90%;
+    --card: 215 28% 11%;
+    --card-foreground: 210 20% 90%;
+    --popover: 215 28% 11%;
+    --popover-foreground: 210 20% 90%;
+    --primary: 207 65% 55%;
+    --primary-foreground: 215 30% 8%;
+    --secondary: 215 20% 18%;
+    --secondary-foreground: 210 20% 82%;
+    --muted: 215 18% 18%;
+    --muted-foreground: 210 10% 55%;
+    --accent: 38 85% 58%;
+    --accent-foreground: 215 30% 8%;
+    --destructive: 0 62% 50%;
+    --destructive-foreground: 210 20% 90%;
+    --border: 215 18% 22%;
+    --input: 215 18% 22%;
+    --ring: 207 65% 55%;
+    --sidebar-background: 215 35% 7%;
+    --sidebar-foreground: 210 25% 92%;
+    --sidebar-primary: 110 48% 55%;
+    --sidebar-primary-foreground: 215 35% 7%;
+    --sidebar-accent: 215 28% 14%;
+    --sidebar-accent-foreground: 210 25% 92%;
+    --sidebar-border: 215 22% 16%;
+    --sidebar-ring: 110 48% 55%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Plus Jakarta Sans', 'Inter', sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+/* Leaflet map */
+.leaflet-container {
+  border-radius: 0.5rem;
+  font-family: 'Plus Jakarta Sans', sans-serif;
+}
+
+/* NDVI color scale */
+.ndvi-excellent { color: #166534; }
+.ndvi-good { color: #15803d; }
+.ndvi-moderate { color: #ca8a04; }
+.ndvi-poor { color: #ea580c; }
+.ndvi-critical { color: #dc2626; }
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: hsl(var(--border)); border-radius: 999px; }
