@@ -8,7 +8,14 @@ import { registerAuthRoutes } from "./auth";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
 
+// Fail fast in production if a required secret is missing rather than silently falling back to a predictable value.
+if (process.env.NODE_ENV === "production" && !process.env.SESSION_SECRET) {
+  console.error("FATAL: SESSION_SECRET environment variable is required in production.");
+  process.exit(1);
+}
+
 const app = express();
+app.set("trust proxy", 1); // required so secure cookies work correctly behind Render/pplx.app's HTTPS-terminating reverse proxy
 const httpServer = createServer(app);
 
 declare module "http" {
@@ -30,14 +37,15 @@ app.use(express.urlencoded({ extended: false }));
 // ─── Session middleware (SQLite-backed — survives server restarts) ──────────
 const SQLiteStore = connectSqlite3(session);
 app.use(session({
-  name: "ntgs_session",          // __Host- prefix required for pplx.app proxy
-  secret: process.env.SESSION_SECRET || "narrowtech-gs-secret-2026",
+  name: "__Host-ntgs_session",   // __Host- prefix required so pplx.app's proxy doesn't strip the cookie
+  secret: process.env.SESSION_SECRET || "", // must be set via env var in deployment; a predictable fallback lets attackers forge session cookies
   resave: false,
   saveUninitialized: false,
   store: new (SQLiteStore as any)({ db: "sessions.db", dir: process.env.NODE_ENV === "production" && require("fs").existsSync("/data") ? "/data" : ".", table: "sessions" }),
   // credentials:"include" on every fetch means the browser always sends this cookie.
   // SameSite=lax works fine here — the session cookie travels with every request.
-  cookie: { secure: process.env.NODE_ENV === "production", httpOnly: true, maxAge: 7 * 24 * 60 * 60 * 1000, sameSite: "lax", path: "/" },
+  // NOTE: __Host- prefixed cookies require Secure=true and Path="/" with no Domain attribute — always set cookie.secure true regardless of NODE_ENV so it still works when proxied over HTTPS in preview/publish sandboxes.
+  cookie: { secure: true, httpOnly: true, maxAge: 7 * 24 * 60 * 60 * 1000, sameSite: "lax", path: "/" },
 }));
 
 export function log(message: string, source = "express") {

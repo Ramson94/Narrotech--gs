@@ -22,7 +22,7 @@ function requireAdmin(req: Request, res: Response, next: NextFunction) {
 // ─── SentinelHub Integration ───────────────────────────────────────────────
 // Copernicus OAuth2 credentials
 const COPERNICUS_USER_ID = process.env.COPERNICUS_USER_ID || "sh-cd0256f9-1e8d-4ba4-9cc6-b7d068c13401";
-const COPERNICUS_ACCOUNT_ID = process.env.COPERNICUS_ACCOUNT_ID || "PeHtgBYW0v1Jda3NMGvKUVSADneWoFLU";
+const COPERNICUS_ACCOUNT_ID = process.env.COPERNICUS_ACCOUNT_ID || ""; // must be set via env var in deployment — this is an OAuth2 client secret, never hardcode it
 // Copernicus Data Space Sentinel Hub endpoints (sh- prefix credentials use cdse.eu, not sentinel-hub.com)
 const SENTINEL_API = "https://sh.dataspace.copernicus.eu/api/v1/process";
 const SENTINEL_STATS_API = "https://sh.dataspace.copernicus.eu/api/v1/statistics";
@@ -480,19 +480,19 @@ export function registerRoutes(httpServer: Server, app: Express) {
   });
 
   // Get all fields
-  app.get("/api/fields", (req, res) => {
+  app.get("/api/fields", requireAuth, (req, res) => {
     res.json(storage.getFields());
   });
 
   // Get single field
-  app.get("/api/fields/:id", (req, res) => {
+  app.get("/api/fields/:id", requireAuth, (req, res) => {
     const field = storage.getField(Number(req.params.id));
     if (!field) return res.status(404).json({ error: "Not found" });
     res.json(field);
   });
 
   // Create field
-  app.post("/api/fields", (req, res) => {
+  app.post("/api/fields", requireAuth, (req, res) => {
     try {
       const data = insertFieldSchema.parse(req.body);
       res.json(storage.createField(data));
@@ -502,7 +502,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
   });
 
   // Analyze field: compute time-series NDVI/MSI over date range
-  app.post("/api/fields/:id/analyze", async (req, res) => {
+  app.post("/api/fields/:id/analyze", requireAuth, async (req, res) => {
     try {
     const field = storage.getField(Number(req.params.id));
     if (!field) return res.status(404).json({ error: "Not found" });
@@ -548,7 +548,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
   });
 
   // Get time-series for a field (with optional date filter)
-  app.get("/api/fields/:id/timeseries", (req, res) => {
+  app.get("/api/fields/:id/timeseries", requireAuth, (req, res) => {
     const field = storage.getField(Number(req.params.id));
     if (!field) return res.status(404).json({ error: "Not found" });
     const data = field.timeSeriesData ? JSON.parse(field.timeSeriesData) : [];
@@ -562,7 +562,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
   });
 
   // Update field
-  app.patch("/api/fields/:id", (req, res) => {
+  app.patch("/api/fields/:id", requireAuth, (req, res) => {
     const field = storage.getField(Number(req.params.id));
     if (!field) return res.status(404).json({ error: "Not found" });
     try {
@@ -574,14 +574,14 @@ export function registerRoutes(httpServer: Server, app: Express) {
   });
 
   // Delete field
-  app.delete("/api/fields/:id", (req, res) => {
+  app.delete("/api/fields/:id", requireAuth, (req, res) => {
     storage.deleteAlertsByField(Number(req.params.id));
     storage.deleteField(Number(req.params.id));
     res.json({ success: true });
   });
 
   // Bi-weekly check: run analysis for all fields where notification is due
-  app.post("/api/notify/check", async (req, res) => {
+  app.post("/api/notify/check", requireAdmin, async (req, res) => {
     const allFields = storage.getFields();
     const due = allFields.filter(f =>
       f.notificationsEnabled && isBiweeklyDue(f.lastNotifiedAt ?? null)
@@ -605,18 +605,18 @@ export function registerRoutes(httpServer: Server, app: Express) {
   });
 
   // Alerts
-  app.get("/api/alerts", (req, res) => { res.json(storage.getAlerts()); });
-  app.get("/api/alerts/field/:fieldId", (req, res) => {
+  app.get("/api/alerts", requireAuth, (req, res) => { res.json(storage.getAlerts()); });
+  app.get("/api/alerts/field/:fieldId", requireAuth, (req, res) => {
     res.json(storage.getAlertsByField(Number(req.params.fieldId)));
   });
-  app.patch("/api/alerts/:id/acknowledge", (req, res) => {
+  app.patch("/api/alerts/:id/acknowledge", requireAuth, (req, res) => {
     storage.acknowledgeAlert(Number(req.params.id));
     res.json({ success: true });
   });
 
   // ─── Spatial map: render NDVI or MSI PNG for a field + date window ────────────
   // Returns a 256x256 false-colour PNG from Sentinel Hub Process API
-  app.get("/api/fields/:id/map", async (req, res) => {
+  app.get("/api/fields/:id/map", requireAuth, async (req, res) => {
     try {
       const field = storage.getField(Number(req.params.id));
       if (!field) return res.status(404).json({ error: "Not found" });
@@ -745,7 +745,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
 
   // ── PDF Report endpoint ─────────────────────────────────────────────────
-  app.get("/api/fields/:id/report", async (req: Request, res: Response) => {
+  app.get("/api/fields/:id/report", requireAuth, async (req: Request, res: Response) => {
     try {
       const id = parseInt(req.params.id);
       const field = storage.getField(id);
@@ -765,7 +765,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
   });
 
   // ── WhatsApp notification endpoint ──────────────────────────────────────
-  app.post("/api/fields/:id/notify-whatsapp", async (req: Request, res: Response) => {
+  app.post("/api/fields/:id/notify-whatsapp", requireAuth, async (req: Request, res: Response) => {
     try {
       const id = parseInt(req.params.id);
       const field = storage.getField(id);
@@ -783,7 +783,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
   });
 
   // ── Get WhatsApp message preview ────────────────────────────────────────
-  app.get("/api/fields/:id/whatsapp-preview", async (req: Request, res: Response) => {
+  app.get("/api/fields/:id/whatsapp-preview", requireAuth, async (req: Request, res: Response) => {
     try {
       const id = parseInt(req.params.id);
       const field = storage.getField(id);
