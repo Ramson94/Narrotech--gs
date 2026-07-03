@@ -25,6 +25,15 @@ if (!sessionSecret) {
   );
 }
 
+// Surface any crash reason instead of dying silently (which the platform reports
+// simply as "No service is running on port <port>" with zero diagnostic info).
+process.on("uncaughtException", (err) => {
+  console.error("FATAL uncaughtException (server did not start or crashed):", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("FATAL unhandledRejection (server did not start or crashed):", reason);
+});
+
 const app = express();
 app.set("trust proxy", 1); // required so secure cookies work correctly behind Render/pplx.app's HTTPS-terminating reverse proxy
 const httpServer = createServer(app);
