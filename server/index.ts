@@ -3,15 +3,26 @@ import express, { Response, NextFunction } from 'express';
 import type { Request } from 'express';
 import session from "express-session";
 import connectSqlite3 from "connect-sqlite3";
+import crypto from "node:crypto";
 import { registerRoutes } from "./routes";
 import { registerAuthRoutes } from "./auth";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
 
-// Fail fast in production if a required secret is missing rather than silently falling back to a predictable value.
-if (process.env.NODE_ENV === "production" && !process.env.SESSION_SECRET) {
-  console.error("FATAL: SESSION_SECRET environment variable is required in production.");
-  process.exit(1);
+// A missing SESSION_SECRET must never crash the whole server (that took the entire
+// app down with 503s on every route, including login/report/WhatsApp, in production).
+// Instead, auto-generate a strong random secret at boot when one isn't supplied via
+// env vars. This still avoids the old predictable-fallback risk (a fresh random value
+// each boot cannot be guessed or reused by an attacker) while keeping the app online.
+// Set SESSION_SECRET explicitly in the deployment environment for sessions that persist
+// across server restarts; otherwise all sessions are invalidated on every restart.
+let sessionSecret = process.env.SESSION_SECRET;
+if (!sessionSecret) {
+  sessionSecret = crypto.randomBytes(32).toString("hex");
+  console.warn(
+    "WARNING: SESSION_SECRET environment variable not set — generated a random secret for this process. " +
+    "Sessions will be invalidated on every server restart. Set SESSION_SECRET explicitly for persistent sessions."
+  );
 }
 
 const app = express();
@@ -38,7 +49,7 @@ app.use(express.urlencoded({ extended: false }));
 const SQLiteStore = connectSqlite3(session);
 app.use(session({
   name: "__Host-ntgs_session",   // __Host- prefix required so pplx.app's proxy doesn't strip the cookie
-  secret: process.env.SESSION_SECRET || "", // must be set via env var in deployment; a predictable fallback lets attackers forge session cookies
+  secret: sessionSecret,
   resave: false,
   saveUninitialized: false,
   store: new (SQLiteStore as any)({ db: "sessions.db", dir: process.env.NODE_ENV === "production" && require("fs").existsSync("/data") ? "/data" : ".", table: "sessions" }),

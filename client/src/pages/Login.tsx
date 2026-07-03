@@ -6,12 +6,10 @@ import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Leaf, Droplets, AlertCircle, Eye, EyeOff } from "lucide-react";
 
-type Mode = "login" | "register";
-
+// Public self-service registration is disabled (admin-only access model) — this page is
+// login-only. New accounts are created by the admin from inside the app, not from here.
 export default function Login() {
-  const { login, register } = useAuth();
-  const [mode, setMode] = useState<Mode>("login");
-  const [name, setName] = useState("");
+  const { login } = useAuth();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPw, setShowPw] = useState(false);
@@ -23,12 +21,7 @@ export default function Login() {
     setError("");
     setLoading(true);
     try {
-      if (mode === "login") {
-        await login(email, password);
-      } else {
-        if (!name.trim()) { setError("Full name is required"); setLoading(false); return; }
-        await register(name, email, password);
-      }
+      await login(email, password);
     } catch (err: any) {
       setError(err.message || "Something went wrong");
     } finally {
@@ -66,31 +59,15 @@ export default function Login() {
         <Card className="border-slate-700/50 bg-slate-900/80 backdrop-blur-sm shadow-2xl">
           <CardHeader className="pb-4">
             <CardTitle className="text-white text-lg">
-              {mode === "login" ? "Sign in to your account" : "Create an account"}
+              Sign in to your account
             </CardTitle>
             <CardDescription className="text-slate-400">
-              {mode === "login"
-                ? "Monitor your fields' crop health from anywhere."
-                : "Join NarrowTech GS and start monitoring your crops."}
+              Monitor your fields' crop health from anywhere.
             </CardDescription>
           </CardHeader>
 
           <CardContent>
             <form onSubmit={submit} className="space-y-4">
-              {mode === "register" && (
-                <div className="space-y-1.5">
-                  <Label htmlFor="name" className="text-slate-300 text-sm">Full Name</Label>
-                  <Input
-                    id="name"
-                    placeholder="e.g. Kofi Mensah"
-                    value={name}
-                    onChange={e => setName(e.target.value)}
-                    className="bg-slate-800 border-slate-600 text-white placeholder:text-slate-500 focus:border-[#1E6FA3]"
-                    required
-                  />
-                </div>
-              )}
-
               <div className="space-y-1.5">
                 <Label htmlFor="email" className="text-slate-300 text-sm">Email Address</Label>
                 <Input
@@ -110,7 +87,7 @@ export default function Login() {
                   <Input
                     id="password"
                     type={showPw ? "text" : "password"}
-                    placeholder={mode === "register" ? "At least 6 characters" : "Your password"}
+                    placeholder="Your password"
                     value={password}
                     onChange={e => setPassword(e.target.value)}
                     className="bg-slate-800 border-slate-600 text-white placeholder:text-slate-500 focus:border-[#1E6FA3] pr-10"
@@ -138,35 +115,13 @@ export default function Login() {
                 disabled={loading}
                 className="w-full bg-[#1E6FA3] hover:bg-[#1a5f8e] text-white font-semibold h-10"
               >
-                {loading ? "Please wait…" : mode === "login" ? "Sign In" : "Create Account"}
+                {loading ? "Please wait…" : "Sign In"}
               </Button>
             </form>
 
-            <div className="mt-5 text-center text-sm text-slate-400">
-              {mode === "login" ? (
-                <>
-                  Don't have an account?{" "}
-                  <button onClick={() => { setMode("register"); setError(""); }}
-                    className="text-[#4CAF3D] hover:text-[#5dbf4d] font-medium underline-offset-2 hover:underline">
-                    Register here
-                  </button>
-                </>
-              ) : (
-                <>
-                  Already have an account?{" "}
-                  <button onClick={() => { setMode("login"); setError(""); }}
-                    className="text-[#1E6FA3] hover:text-[#2980b9] font-medium underline-offset-2 hover:underline">
-                    Sign in
-                  </button>
-                </>
-              )}
-            </div>
-
-            {mode === "register" && (
-              <p className="mt-3 text-xs text-slate-500 text-center">
-                The first account created automatically becomes the admin.
-              </p>
-            )}
+            <p className="mt-5 text-center text-xs text-slate-500">
+              Access is by invitation only. Contact the administrator for a login.
+            </p>
           </CardContent>
         </Card>
 

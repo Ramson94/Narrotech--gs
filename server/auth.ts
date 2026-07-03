@@ -5,16 +5,28 @@ import { insertUserSchema } from "@shared/schema";
 
 export function registerAuthRoutes(app: Express) {
   // POST /api/auth/register
+  // Public self-service sign-up is disabled once the first (admin) account exists.
+  // This keeps the app closed to the public: only the owner/admin account can log in
+  // and use the platform, so visitors with the link can't create their own free accounts.
+  // An already-authenticated admin can still create additional accounts (e.g. for farmers
+  // they want to onboard) by calling this same endpoint while logged in.
   app.post("/api/auth/register", async (req, res) => {
     try {
+      const isFirst = storage.countUsers() === 0;
+
+      if (!isFirst) {
+        const requester = req.session?.userId ? storage.getUserById(req.session.userId) : undefined;
+        if (!requester || requester.role !== "admin") {
+          return res.status(403).json({ error: "Public registration is disabled. Contact the administrator for access." });
+        }
+      }
+
       const { name, email, password, role } = insertUserSchema.parse(req.body);
 
       if (storage.getUserByEmail(email)) {
         return res.status(409).json({ error: "Email already registered" });
       }
 
-      // First user ever becomes admin automatically
-      const isFirst = storage.countUsers() === 0;
       const passwordHash = await bcrypt.hash(password, 10);
       const user = storage.createUser({
         name,
@@ -23,7 +35,11 @@ export function registerAuthRoutes(app: Express) {
         role: isFirst ? "admin" : (role || "farmer"),
       });
 
-      req.session.userId = user.id;
+      // Only auto-login the newly created account when it's the very first (admin) signup.
+      // If an admin is creating another user's account, keep the admin's own session active.
+      if (isFirst) {
+        req.session.userId = user.id;
+      }
       res.status(201).json({ id: user.id, name: user.name, email: user.email, role: user.role });
     } catch (e) {
       res.status(400).json({ error: "Invalid data", details: String(e) });
@@ -52,7 +68,7 @@ export function registerAuthRoutes(app: Express) {
   // POST /api/auth/logout
   app.post("/api/auth/logout", (req, res) => {
     req.session.destroy(() => {
-      res.clearCookie("__Host-ntgs");
+      res.clearCookie("__Host-ntgs_session", { path: "/" });
       res.json({ ok: true });
     });
   });

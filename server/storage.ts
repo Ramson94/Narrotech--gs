@@ -72,6 +72,13 @@ for (const stmt of migrateColumns) {
   try { sqlite.exec(stmt); } catch (_) { /* column already exists — safe to ignore */ }
 }
 
+// One-time migration: ensure the app owner's account has admin rights. Public registration
+// is now disabled, so this guarantees the owner can still log in with full access even if
+// their account was originally created as a non-admin ("farmer") role.
+try {
+  sqlite.exec(`UPDATE users SET role = 'admin' WHERE email = 'kabenlaramson@gmail.com' AND role != 'admin'`);
+} catch (_) { /* users table may not exist yet on first boot — safe to ignore */ }
+
 export interface IStorage {
   getFields(): Field[];
   getField(id: number): Field | undefined;
