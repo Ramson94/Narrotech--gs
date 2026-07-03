@@ -3,11 +3,36 @@ import Database from "better-sqlite3";
 import { fields, alerts, appSettings, users, type Field, type InsertField, type Alert, type InsertAlert, type User } from "@shared/schema";
 import { eq } from "drizzle-orm";
 
-// Use /data/data.db on Render (persistent disk), fallback to local for dev
-const DB_PATH = process.env.NODE_ENV === "production" && require("fs").existsSync("/data")
-  ? "/data/data.db"
-  : "data.db";
-const sqlite = new Database(DB_PATH);
+// Use /data/data.db on Render (persistent disk), fallback to local for dev.
+// Defensive: never let a missing/unwritable /data mount crash the process at
+// module-load time (this runs before the HTTP server binds to its port).
+function resolveDbPath(): string {
+  try {
+    if (process.env.NODE_ENV === "production" && require("fs").existsSync("/data")) {
+      // Confirm /data is actually usable (writable directory), not just present.
+      require("fs").accessSync("/data", require("fs").constants.W_OK);
+      return "/data/data.db";
+    }
+  } catch (err) {
+    console.warn("[storage] /data exists but is not usable, falling back to local data.db:", err);
+  }
+  return "data.db";
+}
+
+function openDatabase(): Database.Database {
+  const primaryPath = resolveDbPath();
+  try {
+    return new Database(primaryPath);
+  } catch (err) {
+    console.error(`[storage] Failed to open database at ${primaryPath}, falling back to local data.db:`, err);
+    if (primaryPath !== "data.db") {
+      return new Database("data.db");
+    }
+    throw err;
+  }
+}
+
+const sqlite = openDatabase();
 export const db = drizzle(sqlite);
 
 sqlite.exec(`

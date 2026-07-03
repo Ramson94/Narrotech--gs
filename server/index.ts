@@ -73,8 +73,33 @@ app.use(express.urlencoded({ extended: false }));
 // (e.g. prebuilt binary download blocked, or node-gyp toolchain unavailable),
 // `npm ci` would fail entirely and the server process would never start,
 // which the platform reports simply as "No service is running on port 5000".
-const sessionDbDir = process.env.NODE_ENV === "production" && fsExistsSyncSafe("/data") ? "/data" : ".";
-const sessionDb = new Database(path.join(sessionDbDir, "sessions.db"));
+function resolveSessionDbDir(): string {
+  try {
+    if (process.env.NODE_ENV === "production" && fsExistsSyncSafe("/data")) {
+      fs.accessSync("/data", fs.constants.W_OK);
+      return "/data";
+    }
+  } catch (err) {
+    console.warn("[index] /data exists but is not usable for sessions, falling back to local dir:", err);
+  }
+  return ".";
+}
+
+function openSessionDb(): InstanceType<typeof Database> {
+  const dir = resolveSessionDbDir();
+  const primaryPath = path.join(dir, "sessions.db");
+  try {
+    return new Database(primaryPath);
+  } catch (err) {
+    console.error(`[index] Failed to open session DB at ${primaryPath}, falling back to local sessions.db:`, err);
+    if (primaryPath !== "sessions.db") {
+      return new Database("sessions.db");
+    }
+    throw err;
+  }
+}
+
+const sessionDb = openSessionDb();
 const SqliteSessionStore = sqliteStoreFactory(session);
 app.use(session({
   name: "__Host-ntgs_session",   // __Host- prefix required so pplx.app's proxy doesn't strip the cookie
