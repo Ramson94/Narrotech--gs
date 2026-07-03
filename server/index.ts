@@ -2,12 +2,23 @@ import "dotenv/config";
 import express, { Response, NextFunction } from 'express';
 import type { Request } from 'express';
 import session from "express-session";
-import connectSqlite3 from "connect-sqlite3";
+import Database from "better-sqlite3";
+import sqliteStoreFactory from "better-sqlite3-session-store";
 import crypto from "node:crypto";
+import path from "node:path";
+import fs from "node:fs";
 import { registerRoutes } from "./routes";
 import { registerAuthRoutes } from "./auth";
 import { serveStatic } from "./static";
 import { createServer } from "node:http";
+
+function fsExistsSyncSafe(p: string): boolean {
+  try {
+    return fs.existsSync(p);
+  } catch {
+    return false;
+  }
+}
 
 // A missing SESSION_SECRET must never crash the whole server (that took the entire
 // app down with 503s on every route, including login/report/WhatsApp, in production).
@@ -55,13 +66,22 @@ app.use(
 app.use(express.urlencoded({ extended: false }));
 
 // ─── Session middleware (SQLite-backed — survives server restarts) ──────────
-const SQLiteStore = connectSqlite3(session);
+// Uses better-sqlite3 (already a required dependency for the main app database)
+// instead of the separate `connect-sqlite3` + `sqlite3` native modules. This
+// avoids a second independent native-module compilation at install time —
+// previously, if that second native build failed in a deployment sandbox
+// (e.g. prebuilt binary download blocked, or node-gyp toolchain unavailable),
+// `npm ci` would fail entirely and the server process would never start,
+// which the platform reports simply as "No service is running on port 5000".
+const sessionDbDir = process.env.NODE_ENV === "production" && fsExistsSyncSafe("/data") ? "/data" : ".";
+const sessionDb = new Database(path.join(sessionDbDir, "sessions.db"));
+const SqliteSessionStore = sqliteStoreFactory(session);
 app.use(session({
   name: "__Host-ntgs_session",   // __Host- prefix required so pplx.app's proxy doesn't strip the cookie
   secret: sessionSecret,
   resave: false,
   saveUninitialized: false,
-  store: new (SQLiteStore as any)({ db: "sessions.db", dir: process.env.NODE_ENV === "production" && require("fs").existsSync("/data") ? "/data" : ".", table: "sessions" }),
+  store: new SqliteSessionStore({ client: sessionDb, expired: { clear: true, intervalMs: 15 * 60 * 1000 } }),
   // credentials:"include" on every fetch means the browser always sends this cookie.
   // SameSite=lax works fine here — the session cookie travels with every request.
   // NOTE: __Host- prefixed cookies require Secure=true and Path="/" with no Domain attribute — always set cookie.secure true regardless of NODE_ENV so it still works when proxied over HTTPS in preview/publish sandboxes.
