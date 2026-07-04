@@ -820,6 +820,56 @@ export function registerRoutes(httpServer: Server, app: Express) {
     return inside;
   }
 
+  // ─── DBSCAN clustering over grid cells ──────────────────────────────────────
+  // Groups density-connected stressed cells into irregularly-shaped clusters
+  // instead of anchoring one pin per isolated worst pixel. Distance metric is
+  // Chebyshev (8-connected) grid distance, so eps=1.5 means "touches one of my
+  // 8 neighbors". minPts=1 means a single isolated stressed cell still forms
+  // its own valid cluster (coarse 40x40 grids can have real but small hotspots).
+  type GridCell = { row: number; col: number; lat: number; lng: number; value: number };
+  function dbscanCluster<T extends GridCell>(points: T[], eps = 1.5, minPts = 1): T[][] {
+    const n = points.length;
+    const visited = new Array(n).fill(false);
+    const clustered = new Array(n).fill(false);
+    const clusters: T[][] = [];
+
+    const regionQuery = (i: number): number[] => {
+      const neighbors: number[] = [];
+      for (let j = 0; j < n; j++) {
+        if (i === j) continue;
+        const dRow = Math.abs(points[i].row - points[j].row);
+        const dCol = Math.abs(points[i].col - points[j].col);
+        if (Math.max(dRow, dCol) <= eps) neighbors.push(j);
+      }
+      return neighbors;
+    };
+
+    for (let i = 0; i < n; i++) {
+      if (visited[i]) continue;
+      visited[i] = true;
+      const neighbors = regionQuery(i);
+      if (neighbors.length + 1 < minPts) continue; // noise — too isolated even for minPts=1 edge case
+
+      const cluster: T[] = [points[i]];
+      clustered[i] = true;
+      const seeds = [...neighbors];
+      while (seeds.length > 0) {
+        const j = seeds.shift()!;
+        if (!visited[j]) {
+          visited[j] = true;
+          const jNeighbors = regionQuery(j);
+          if (jNeighbors.length + 1 >= minPts) seeds.push(...jNeighbors);
+        }
+        if (!clustered[j]) {
+          clustered[j] = true;
+          cluster.push(points[j]);
+        }
+      }
+      clusters.push(cluster);
+    }
+    return clusters;
+  }
+
   // ─── Stress zones: find worst sub-areas within a field and return GPS pins ──
   // Requests a coarse grayscale grid from Sentinel Hub where pixel intensity
   // directly encodes the normalized index value (0-255), decodes it locally,
@@ -962,35 +1012,76 @@ export function registerRoutes(httpServer: Server, app: Express) {
         return res.json({ zones: [], message: "No valid pixels found inside field boundary for this date (cloud cover or field too small)." });
       }
 
-      // Rank by stress severity: for MSI, higher = worse; for NDVI/EVI, lower = worse.
-      const sorted = [...cells].sort((a, b) => isStressHigh ? b.value - a.value : a.value - b.value);
-
-      // Greedy spatial clustering: pick the worst cell, then skip nearby cells
-      // (within ~3 grid cells) so zones are spatially distinct, not 10 adjacent pixels.
-      const minSeparation = 3; // grid cells
-      const zones: Cell[] = [];
-      for (const cell of sorted) {
-        if (zones.length >= limit) break;
-        const tooClose = zones.some(z => Math.abs(z.row - cell.row) < minSeparation && Math.abs(z.col - cell.col) < minSeparation);
-        if (!tooClose) zones.push(cell);
-      }
-
       // Compute overall field stats for context (mean value of valid cells)
       const meanValue = cells.reduce((s, c) => s + c.value, 0) / cells.length;
+      const deviationOf = (v: number) => isStressHigh ? v - meanValue : meanValue - v;
 
-      const result = zones.map((z, i) => {
+      // Only cluster cells that actually qualify as stressed ("moderate" threshold
+      // or worse) — clustering the whole field would just produce one giant blob.
+      const STRESS_QUALIFY_DEVIATION = 0.12;
+      const stressedCells = cells.filter(c => deviationOf(c.value) > STRESS_QUALIFY_DEVIATION);
+
+      if (stressedCells.length === 0) {
+        return res.json({
+          index: index.toLowerCase(),
+          date,
+          fieldMean: Math.round(meanValue * 1000) / 1000,
+          zones: [],
+          message: "No distinct stress zones — field looks fairly uniform for this date.",
+        });
+      }
+
+      // DBSCAN groups density-connected stressed cells into irregularly-shaped
+      // clusters (handles the "2 bad pixels on the left, 2 on the right" case
+      // correctly — those become two separate clusters since they're far apart,
+      // while adjacent bad pixels within the same patch merge into one cluster).
+      const rawClusters = dbscanCluster(stressedCells, 1.5, 1);
+
+      // For each cluster: pin location = severity-weighted centroid (pulls the
+      // pin toward the worst part of an irregular blob rather than its plain
+      // geometric center); reported value/severity = the single worst cell in
+      // that cluster (so the number shown matches what's physically near the pin).
+      type ClusterSummary = {
+        lat: number; lng: number; worstValue: number; cellCount: number; deviation: number;
+      };
+      const clusterSummaries: ClusterSummary[] = rawClusters.map(cluster => {
+        let worst = cluster[0];
+        for (const c of cluster) {
+          if (deviationOf(c.value) > deviationOf(worst.value)) worst = c;
+        }
+        let wSum = 0, latSum = 0, lngSum = 0;
+        for (const c of cluster) {
+          const w = Math.max(deviationOf(c.value), 0.001); // weight by stress severity
+          wSum += w;
+          latSum += c.lat * w;
+          lngSum += c.lng * w;
+        }
+        return {
+          lat: latSum / wSum,
+          lng: lngSum / wSum,
+          worstValue: worst.value,
+          cellCount: cluster.length,
+          deviation: deviationOf(worst.value),
+        };
+      });
+
+      // Rank clusters by their worst-cell severity, cap at the requested limit.
+      clusterSummaries.sort((a, b) => b.deviation - a.deviation);
+      const topClusters = clusterSummaries.slice(0, limit);
+
+      const result = topClusters.map((z, i) => {
         let severity: "critical" | "warning" | "moderate";
-        const deviation = isStressHigh ? z.value - meanValue : meanValue - z.value;
-        if (deviation > 0.25) severity = "critical";
-        else if (deviation > 0.12) severity = "warning";
+        if (z.deviation > 0.25) severity = "critical";
+        else if (z.deviation > 0.12) severity = "warning";
         else severity = "moderate";
         return {
           id: i + 1,
           label: `Zone ${String.fromCharCode(65 + i)}`, // Zone A, B, C...
           lat: Math.round(z.lat * 1e6) / 1e6,
           lng: Math.round(z.lng * 1e6) / 1e6,
-          value: Math.round(z.value * 1000) / 1000,
+          value: Math.round(z.worstValue * 1000) / 1000,
           severity,
+          cellCount: z.cellCount,
           navigateUrl: `https://www.google.com/maps/dir/?api=1&destination=${z.lat.toFixed(6)},${z.lng.toFixed(6)}&travelmode=walking`,
         };
       });
