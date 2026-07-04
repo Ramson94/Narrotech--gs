@@ -6,7 +6,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Map, Layers, Calendar, Info, ZoomIn, Download, Share2, Check } from "lucide-react";
+import { Map, Layers, Calendar, Info, ZoomIn, Download, Share2, Check, Navigation, MapPin } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import type { Field } from "@shared/schema";
 
@@ -472,6 +472,118 @@ function MapTile({
   );
 }
 
+// ── Stress zones panel: navigable GPS pins for the worst sub-areas ──────────
+type StressZone = {
+  id: number;
+  label: string;
+  lat: number;
+  lng: number;
+  value: number;
+  severity: "critical" | "warning" | "moderate";
+  navigateUrl: string;
+};
+
+const SEVERITY_STYLES: Record<StressZone["severity"], { badge: string; dot: string; text: string }> = {
+  critical: { badge: "bg-red-100 text-red-700 border-red-200 dark:bg-red-950/40 dark:text-red-400 dark:border-red-900", dot: "bg-red-500", text: "Critical" },
+  warning:  { badge: "bg-amber-100 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-400 dark:border-amber-900", dot: "bg-amber-500", text: "Warning" },
+  moderate: { badge: "bg-blue-100 text-blue-700 border-blue-200 dark:bg-blue-950/40 dark:text-blue-400 dark:border-blue-900", dot: "bg-blue-500", text: "Moderate" },
+};
+
+function StressZonesPanel({
+  fieldId, date, index, indexLabel,
+}: {
+  fieldId: number;
+  date: string;
+  index: "ndvi" | "msi";
+  indexLabel: string;
+}) {
+  const { data, isLoading, isError } = useQuery<{ zones: StressZone[]; fieldMean?: number; message?: string }>({
+    queryKey: [`/api/fields/${fieldId}/stress-zones`, date, index],
+    queryFn: async () => {
+      const res = await apiRequest("GET", `/api/fields/${fieldId}/stress-zones?date=${date}&index=${index}&maxZones=5`);
+      if (!res.ok) throw new Error("Stress zone analysis failed");
+      return res.json();
+    },
+    staleTime: 24 * 60 * 60 * 1000,
+    retry: 1,
+  });
+
+  if (isLoading) {
+    return (
+      <div className="space-y-2">
+        <Skeleton className="h-4 w-40" />
+        <Skeleton className="h-16 w-full rounded-lg" />
+      </div>
+    );
+  }
+
+  if (isError) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        Couldn't compute stress zones for this date — try a different observation date.
+      </p>
+    );
+  }
+
+  const zones = data?.zones || [];
+
+  if (zones.length === 0) {
+    return (
+      <p className="text-xs text-muted-foreground">
+        {data?.message || "No distinct stress zones detected — this field looks uniform for this date."}
+      </p>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-1.5">
+        <MapPin size={13} className="text-muted-foreground" />
+        <span className="text-xs font-semibold text-foreground">
+          Worst {indexLabel} zones — tap Navigate to walk there
+        </span>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+        {zones.map(zone => {
+          const style = SEVERITY_STYLES[zone.severity];
+          return (
+            <div
+              key={zone.id}
+              className="flex items-center justify-between gap-2 rounded-lg border border-border bg-card px-3 py-2"
+              data-testid={`stress-zone-${zone.id}`}
+            >
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5">
+                  <span className={`inline-block w-2 h-2 rounded-full flex-shrink-0 ${style.dot}`} />
+                  <span className="text-xs font-semibold text-foreground truncate">{zone.label}</span>
+                  <Badge variant="outline" className={`text-[10px] px-1.5 py-0 border ${style.badge}`}>
+                    {style.text}
+                  </Badge>
+                </div>
+                <p className="text-[11px] text-muted-foreground mt-0.5 truncate">
+                  {indexLabel} {zone.value.toFixed(2)} · {zone.lat.toFixed(5)}, {zone.lng.toFixed(5)}
+                </p>
+              </div>
+              <a
+                href={zone.navigateUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex-shrink-0"
+                data-testid={`button-navigate-${zone.id}`}
+              >
+                <Button variant="outline" size="sm" className="h-7 px-2 text-[11px] gap-1">
+                  <Navigation size={11} />
+                  Navigate
+                </Button>
+              </a>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 // ── Date window row (one observation date) ──────────────────────────────────
 function DateRow({
   fieldId, date, coords, fieldName
@@ -492,6 +604,10 @@ function DateRow({
         <MapTile fieldId={fieldId} date={date} type="ndvi" label="NDVI — Vegetation Index" coords={coords} fieldName={fieldName} />
         <MapTile fieldId={fieldId} date={date} type="msi"  label="MSI — Moisture Stress"   coords={coords} fieldName={fieldName} />
         <MapTile fieldId={fieldId} date={date} type="evi"  label="EVI — Enhanced Vegetation" coords={coords} fieldName={fieldName} />
+      </div>
+      <div className="pt-3 border-t border-border space-y-4">
+        <StressZonesPanel fieldId={fieldId} date={date} index="ndvi" indexLabel="NDVI" />
+        <StressZonesPanel fieldId={fieldId} date={date} index="msi" indexLabel="MSI" />
       </div>
     </div>
   );

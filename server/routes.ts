@@ -1,5 +1,6 @@
 import type { Express } from "express";
 import { Server } from "http";
+import zlib from "zlib";
 import { storage } from "./storage";
 import { insertFieldSchema } from "@shared/schema";
 import { generateFieldReport } from "./report";
@@ -743,6 +744,268 @@ export function registerRoutes(httpServer: Server, app: Express) {
     }
   });
 
+
+  // ─── Minimal dependency-free PNG decoder (grayscale/RGB, 8-bit) ────────────
+  // Decodes IHDR + IDAT chunks manually via zlib.inflateSync — avoids adding
+  // an image-decoding dependency just to read back raw index values.
+  function decodePNG(buf: Buffer): { width: number; height: number; channels: number; pixels: Buffer } {
+    let offset = 8; // skip PNG signature
+    let width = 0, height = 0, bitDepth = 8, colorType = 0;
+    const idatChunks: Buffer[] = [];
+    while (offset < buf.length) {
+      const len = buf.readUInt32BE(offset);
+      const type = buf.toString("ascii", offset + 4, offset + 8);
+      const dataStart = offset + 8;
+      if (type === "IHDR") {
+        width = buf.readUInt32BE(dataStart);
+        height = buf.readUInt32BE(dataStart + 4);
+        bitDepth = buf.readUInt8(dataStart + 8);
+        colorType = buf.readUInt8(dataStart + 9);
+      } else if (type === "IDAT") {
+        idatChunks.push(buf.subarray(dataStart, dataStart + len));
+      } else if (type === "IEND") {
+        break;
+      }
+      offset = dataStart + len + 4; // skip CRC
+    }
+    const raw = zlib.inflateSync(Buffer.concat(idatChunks));
+    const channelsMap: Record<number, number> = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
+    const channels = channelsMap[colorType] || 1;
+    const bytesPerPixel = Math.ceil((channels * bitDepth) / 8);
+    const stride = Math.ceil((width * channels * bitDepth) / 8);
+    const pixels = Buffer.alloc(height * stride);
+    let prevRow = Buffer.alloc(stride);
+    let pos = 0;
+    for (let y = 0; y < height; y++) {
+      const filterType = raw[pos]; pos++;
+      const row = raw.subarray(pos, pos + stride);
+      pos += stride;
+      const outRow = pixels.subarray(y * stride, (y + 1) * stride);
+      for (let x = 0; x < stride; x++) {
+        const a = x >= bytesPerPixel ? outRow[x - bytesPerPixel] : 0;
+        const b = prevRow[x];
+        const c = x >= bytesPerPixel ? prevRow[x - bytesPerPixel] : 0;
+        let val: number;
+        switch (filterType) {
+          case 0: val = row[x]; break;
+          case 1: val = (row[x] + a) & 0xff; break;
+          case 2: val = (row[x] + b) & 0xff; break;
+          case 3: val = (row[x] + Math.floor((a + b) / 2)) & 0xff; break;
+          case 4: {
+            const p = a + b - c;
+            const pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+            const pr = (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
+            val = (row[x] + pr) & 0xff;
+            break;
+          }
+          default: val = row[x];
+        }
+        outRow[x] = val;
+      }
+      prevRow = outRow;
+    }
+    return { width, height, channels, pixels };
+  }
+
+  // Point-in-polygon test (ray casting) — coords is [{lat,lng}, ...]
+  function pointInPolygon(lat: number, lng: number, coords: { lat: number; lng: number }[]): boolean {
+    let inside = false;
+    for (let i = 0, j = coords.length - 1; i < coords.length; j = i++) {
+      const xi = coords[i].lng, yi = coords[i].lat;
+      const xj = coords[j].lng, yj = coords[j].lat;
+      const intersect = ((yi > lat) !== (yj > lat)) &&
+        (lng < ((xj - xi) * (lat - yi)) / (yj - yi) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  // ─── Stress zones: find worst sub-areas within a field and return GPS pins ──
+  // Requests a coarse grayscale grid from Sentinel Hub where pixel intensity
+  // directly encodes the normalized index value (0-255), decodes it locally,
+  // filters to cells inside the actual field polygon (not just its bbox),
+  // then clusters the worst cells into a handful of navigable zones.
+  app.get("/api/fields/:id/stress-zones", requireAuth, async (req, res) => {
+    try {
+      const field = storage.getField(Number(req.params.id));
+      if (!field) return res.status(404).json({ error: "Not found" });
+
+      const { date, index = "ndvi", maxZones = "5" } = req.query as { date?: string; index?: string; maxZones?: string };
+      if (!date) return res.status(400).json({ error: "date query param required (YYYY-MM-DD)" });
+      const limit = Math.max(1, Math.min(10, parseInt(maxZones) || 5));
+
+      const d = new Date(date);
+      const winFrom = new Date(d); winFrom.setDate(d.getDate() - 3);
+      const winTo = new Date(d); winTo.setDate(d.getDate() + 3);
+      const fromStr = winFrom.toISOString().split("T")[0];
+      const toStr = winTo.toISOString().split("T")[0];
+
+      const coords = JSON.parse(field.coordinates) as { lat: number; lng: number }[];
+      const lats = coords.map(c => c.lat);
+      const lngs = coords.map(c => c.lng);
+      const buf = 0.002; // smaller buffer than the display map — we want the grid tight to the field
+      const minLng = Math.min(...lngs) - buf, minLat = Math.min(...lats) - buf;
+      const maxLng = Math.max(...lngs) + buf, maxLat = Math.max(...lats) + buf;
+      const bbox = [minLng, minLat, maxLng, maxLat];
+
+      const token = await getSentinelToken();
+      if (!token) {
+        return res.status(503).json({ error: "No Sentinel Hub token — check credentials" });
+      }
+
+      const GRID = 40; // 40x40 grid — fine enough for sub-field zones, coarse enough to be fast
+
+      // Evalscript encodes the raw index value directly as an 8-bit grayscale value.
+      // Cloud/water pixels are encoded as a reserved sentinel (255) so we can exclude them.
+      let evalscript: string;
+      let isStressHigh: boolean; // true = higher raw value means MORE stress (e.g. MSI)
+      if (index === "msi") {
+        isStressHigh = true;
+        evalscript = [
+          "//VERSION=3",
+          "function setup(){return{input:[{bands:['B8A','B11','SCL']}],output:{bands:1,sampleType:'UINT8'}};}",
+          "function evaluatePixel(s){",
+          "  if([8,9,10].includes(s.SCL)||s.SCL===6)return[255];", // cloud or water → sentinel
+          "  var msi=(s.B11/(s.B8A+0.001));",
+          "  var v=Math.max(0,Math.min(1,(msi-0.1)/1.5));",
+          "  return[Math.round(v*254)];", // 0-254 range, 255 reserved for excluded
+          "}"
+        ].join("\n");
+      } else {
+        isStressHigh = false; // low NDVI/EVI = more stress
+        const band = index === "evi" ? "evi" : "ndvi";
+        if (band === "evi") {
+          evalscript = [
+            "//VERSION=3",
+            "function setup(){return{input:[{bands:['B02','B04','B08','SCL']}],output:{bands:1,sampleType:'UINT8'}};}",
+            "function evaluatePixel(s){",
+            "  if([8,9,10].includes(s.SCL)||s.SCL===6)return[255];",
+            "  var n=s.B08,r=s.B04,b=s.B02;",
+            "  var den=n+6*r-7.5*b+1;",
+            "  var evi=Math.abs(den)<0.01?0:2.5*(n-r)/den;",
+            "  var v=Math.max(0,Math.min(1,(evi+0.2)/0.9));",
+            "  return[Math.round(v*254)];",
+            "}"
+          ].join("\n");
+        } else {
+          evalscript = [
+            "//VERSION=3",
+            "function setup(){return{input:[{bands:['B04','B08','SCL']}],output:{bands:1,sampleType:'UINT8'}};}",
+            "function evaluatePixel(s){",
+            "  if([8,9,10].includes(s.SCL)||s.SCL===6)return[255];",
+            "  var n=(s.B08-s.B04)/(s.B08+s.B04+0.0001);",
+            "  var v=Math.max(0,Math.min(1,(n+0.2)/1.0));",
+            "  return[Math.round(v*254)];",
+            "}"
+          ].join("\n");
+        }
+      }
+
+      const body = {
+        input: {
+          bounds: { bbox, properties: { crs: "http://www.opengis.net/def/crs/EPSG/0/4326" } },
+          data: [{
+            type: "sentinel-2-l2a",
+            dataFilter: {
+              timeRange: { from: `${fromStr}T00:00:00Z`, to: `${toStr}T23:59:59Z` },
+              maxCloudCoverage: 80,
+              mosaickingOrder: "leastCC"
+            }
+          }]
+        },
+        output: { width: GRID, height: GRID, responses: [{ identifier: "default", format: { type: "image/png" } }] },
+        evalscript
+      };
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 20000);
+      const imgRes = await fetch(SENTINEL_API, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "Accept": "image/png"
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+
+      if (!imgRes.ok) {
+        const err = await imgRes.text();
+        console.warn("Stress-zones render error:", imgRes.status, err.slice(0, 200));
+        return res.status(imgRes.status).json({ error: "Stress zone analysis failed", detail: err.slice(0, 200) });
+      }
+
+      const pngBuf = Buffer.from(await imgRes.arrayBuffer());
+      const decoded = decodePNG(pngBuf);
+
+      // Build candidate cells: grid position → lat/lng → raw value
+      type Cell = { row: number; col: number; lat: number; lng: number; value: number; raw: number };
+      const cells: Cell[] = [];
+      const lngStep = (maxLng - minLng) / decoded.width;
+      const latStep = (maxLat - minLat) / decoded.height;
+      for (let row = 0; row < decoded.height; row++) {
+        for (let col = 0; col < decoded.width; col++) {
+          const raw = decoded.pixels[row * decoded.width * decoded.channels + col * decoded.channels];
+          if (raw === 255) continue; // cloud/water excluded
+          // Cell center lat/lng (image row 0 = top = maxLat)
+          const lng = minLng + (col + 0.5) * lngStep;
+          const lat = maxLat - (row + 0.5) * latStep;
+          if (!pointInPolygon(lat, lng, coords)) continue; // only keep cells inside the actual field shape
+          const value = raw / 254; // normalized 0-1
+          cells.push({ row, col, lat, lng, value, raw });
+        }
+      }
+
+      if (cells.length === 0) {
+        return res.json({ zones: [], message: "No valid pixels found inside field boundary for this date (cloud cover or field too small)." });
+      }
+
+      // Rank by stress severity: for MSI, higher = worse; for NDVI/EVI, lower = worse.
+      const sorted = [...cells].sort((a, b) => isStressHigh ? b.value - a.value : a.value - b.value);
+
+      // Greedy spatial clustering: pick the worst cell, then skip nearby cells
+      // (within ~3 grid cells) so zones are spatially distinct, not 10 adjacent pixels.
+      const minSeparation = 3; // grid cells
+      const zones: Cell[] = [];
+      for (const cell of sorted) {
+        if (zones.length >= limit) break;
+        const tooClose = zones.some(z => Math.abs(z.row - cell.row) < minSeparation && Math.abs(z.col - cell.col) < minSeparation);
+        if (!tooClose) zones.push(cell);
+      }
+
+      // Compute overall field stats for context (mean value of valid cells)
+      const meanValue = cells.reduce((s, c) => s + c.value, 0) / cells.length;
+
+      const result = zones.map((z, i) => {
+        let severity: "critical" | "warning" | "moderate";
+        const deviation = isStressHigh ? z.value - meanValue : meanValue - z.value;
+        if (deviation > 0.25) severity = "critical";
+        else if (deviation > 0.12) severity = "warning";
+        else severity = "moderate";
+        return {
+          id: i + 1,
+          label: `Zone ${String.fromCharCode(65 + i)}`, // Zone A, B, C...
+          lat: Math.round(z.lat * 1e6) / 1e6,
+          lng: Math.round(z.lng * 1e6) / 1e6,
+          value: Math.round(z.value * 1000) / 1000,
+          severity,
+          navigateUrl: `https://www.google.com/maps/dir/?api=1&destination=${z.lat.toFixed(6)},${z.lng.toFixed(6)}&travelmode=walking`,
+        };
+      });
+
+      res.json({
+        index: index.toLowerCase(),
+        date,
+        fieldMean: Math.round(meanValue * 1000) / 1000,
+        zones: result,
+      });
+    } catch (err) {
+      console.error("Stress-zones route error:", err);
+      res.status(500).json({ error: "Stress zone analysis failed", detail: String(err) });
+    }
+  });
 
   // ── PDF Report endpoint ─────────────────────────────────────────────────
   app.get("/api/fields/:id/report", requireAuth, async (req: Request, res: Response) => {
