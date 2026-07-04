@@ -104,6 +104,25 @@ try {
   sqlite.exec(`UPDATE users SET role = 'admin' WHERE email = 'kabenlaramson@gmail.com' AND role != 'admin'`);
 } catch (_) { /* users table may not exist yet on first boot — safe to ignore */ }
 
+// One-time seed migration: on a fresh/reset database (e.g. Render free-tier disk wipe on
+// restart), guarantee the owner's account exists with admin rights, and remove the specific
+// stray test account created while diagnosing this deploy. Idempotent — a no-op once the
+// owner account already exists correctly. Safe to leave in place long-term.
+try {
+  const ownerEmail = "kabenlaramson@gmail.com";
+  const ownerRow = sqlite.prepare("SELECT id FROM users WHERE email = ?").get(ownerEmail) as { id: number } | undefined;
+  if (!ownerRow) {
+    sqlite.exec(`
+      INSERT INTO users (name, email, password_hash, role, created_at)
+      VALUES ('Ramson Kabenla', '${ownerEmail}', '$2b$10$DIeFizIFsEA5x03UoSorJ.kYSDPe/xI9sdVCV81q3w3JqaxqVbLSu', 'admin', datetime('now'))
+    `);
+  }
+  // Remove the throwaway test account created while diagnosing the empty-DB-after-deploy issue.
+  sqlite.exec(`DELETE FROM users WHERE email = 'randomtest@example.com'`);
+} catch (err) {
+  console.warn("[storage] owner seed migration skipped/failed (non-fatal):", err);
+}
+
 export interface IStorage {
   getFields(): Field[];
   getField(id: number): Field | undefined;
