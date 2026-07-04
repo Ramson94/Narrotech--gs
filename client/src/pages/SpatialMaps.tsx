@@ -562,9 +562,13 @@ function StressZonesPanel({
                   </Badge>
                 </div>
                 <p className="text-[11px] text-muted-foreground mt-0.5 truncate">
-                  {indexLabel} {zone.value.toFixed(2)} · {zone.lat.toFixed(5)}, {zone.lng.toFixed(5)}
-                  {zone.cellCount && zone.cellCount > 1 ? ` · ~${zone.cellCount} cells` : ""}
+                  {indexLabel} {zone.value.toFixed(2)} · {zone.lat.toFixed(3)}, {zone.lng.toFixed(3)}
                 </p>
+                {zone.cellCount && zone.cellCount > 1 ? (
+                  <p className="text-[10px] text-muted-foreground/80 mt-0.5">
+                    Affects ~{zone.cellCount} plots in this patch
+                  </p>
+                ) : null}
               </div>
               <a
                 href={zone.navigateUrl}
