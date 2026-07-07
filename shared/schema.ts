@@ -14,7 +14,8 @@ export const fields = sqliteTable("fields", {
   evi: real("evi"),
   healthScore: integer("health_score"),
   status: text("status").default("pending"), // pending, analyzed, alert
-  // JSON array of {date, ndvi, ndwi, evi, cloudCover, isWater, dataSource}
+  // JSON array of FieldTimeSeriesPoint (see type below):
+  // {date, ndvi, ndwi, evi, soilMoisture, cloudCover, isWater, dataSource}
   timeSeriesData: text("time_series_data"),
   // Date range used for last analysis
   dateFrom: text("date_from"),
@@ -30,6 +31,21 @@ export const fields = sqliteTable("fields", {
 export const insertFieldSchema = createInsertSchema(fields).omit({ id: true });
 export type InsertField = z.infer<typeof insertFieldSchema>;
 export type Field = typeof fields.$inferSelect;
+
+// One per-date observation in a field's `timeSeriesData` JSON array.
+// `ndwi` holds the Moisture Stress Index (MSI); `soilMoisture` is the OPTRAM wetness index W
+// (relative soil moisture, ~0 dry .. 1 wet) or null when unavailable/filtered out for a date.
+export type FieldTimeSeriesPoint = {
+  date: string;
+  ndvi: number | null;
+  ndwi: number | null;
+  evi: number | null;
+  soilMoisture: number | null;
+  cloudCover: number;
+  isWater: boolean;
+  dataSource: string;
+  excluded?: boolean;
+};
 
 export const alerts = sqliteTable("alerts", {
   id: integer("id").primaryKey({ autoIncrement: true }),

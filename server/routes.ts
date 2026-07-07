@@ -149,9 +149,16 @@ async function fetchOneWindow(
   winFrom: string,
   winTo: string,
   cloudCoverMax: number
-): Promise<{ ndvi: number | null; msi: number | null; evi: number | null; cloudCover: number; noData: boolean }> {
+): Promise<{ ndvi: number | null; msi: number | null; evi: number | null; strMean: number | null; strMin: number | null; strMax: number | null; cloudCover: number; noData: boolean }> {
 
   // Build evalscript as array-join to avoid template literal serialization issues with esbuild
+  // NOTE: an additional 'str' output is added for OPTRAM soil-moisture. It reuses the SAME
+  // SCL cloud mask, the SAME already-loaded SWIR band (B11) as MSI, and the SAME reflectance
+  // scale (Sentinel-2 L2A reflectance is delivered as a 0-1 fraction here, so no /10000 is
+  // applied — matching the existing NDVI/MSI math). NDVI/MSI/EVI outputs are left untouched.
+  // Oversaturated SWIR pixels (ρswir at/near 0) blow STR toward infinity, so we emit NaN for
+  // them; the Sentinel Hub Statistics API automatically excludes NaN pixels from the STR
+  // statistics WITHOUT affecting the shared dataMask (i.e. NDVI/MSI stats are unchanged).
   const evalscript = [
     "//VERSION=3",
     "function setup() {",
@@ -161,6 +168,7 @@ async function fetchOneWindow(
     "      { id: 'ndvi',     bands: 1, sampleType: 'FLOAT32' },",
     "      { id: 'msi',      bands: 1, sampleType: 'FLOAT32' },",
     "      { id: 'evi',      bands: 1, sampleType: 'FLOAT32' },",
+    "      { id: 'str',      bands: 1, sampleType: 'FLOAT32' },",
     "      { id: 'dataMask', bands: 1, sampleType: 'UINT8'   }",
     "    ],",
     "    mosaicking: 'SIMPLE'",
@@ -168,13 +176,16 @@ async function fetchOneWindow(
     "}",
     "function evaluatePixel(s) {",
     "  var scl = s.SCL;",
-    "  if ([8,9,10,3].includes(scl) || scl === 6) return { ndvi:[0], msi:[0], evi:[0], dataMask:[0] };",
+    "  if ([8,9,10,3].includes(scl) || scl === 6) return { ndvi:[0], msi:[0], evi:[0], str:[NaN], dataMask:[0] };",
     "  var n=s.B08, r=s.B04, nir8a=s.B8A, sw=s.B11, b=s.B02;",
     "  var d1=n+r, d2=nir8a;",
-    "  if (d1 < 0.01 || d2 < 0.01) return { ndvi:[0], msi:[0], evi:[0], dataMask:[0] };",
+    "  if (d1 < 0.01 || d2 < 0.01) return { ndvi:[0], msi:[0], evi:[0], str:[NaN], dataMask:[0] };",
     "  var eviDen = n + 6*r - 7.5*b + 1;",
     "  var evi = Math.abs(eviDen) < 0.01 ? 0 : 2.5*(n-r)/eviDen;",
-    "  return { ndvi:[(n-r)/d1], msi:[sw/d2], evi:[evi], dataMask:[1] };",
+    // OPTRAM STR = (1 - ρswir)^2 / (2 * ρswir). Guard the oversaturation floor (ρswir < 0.01,
+    // i.e. < 1% reflectance) with NaN so extreme/invalid STR values never enter the statistics.
+    "  var str = (sw < 0.01) ? NaN : ((1 - sw) * (1 - sw)) / (2 * sw);",
+    "  return { ndvi:[(n-r)/d1], msi:[sw/d2], evi:[evi], str:[str], dataMask:[1] };",
     "}"
   ].join("\n");
 
@@ -198,7 +209,8 @@ async function fetchOneWindow(
     calculations: {
       ndvi: { statistics: { default: {} } },
       msi:  { statistics: { default: {} } },
-      evi:  { statistics: { default: {} } }
+      evi:  { statistics: { default: {} } },
+      str:  { statistics: { default: {} } }
     }
   };
 
@@ -220,20 +232,21 @@ async function fetchOneWindow(
     if (!res.ok) {
       const errText = await res.text();
       console.warn("Stats API error:", res.status, errText.slice(0, 400));
-      return { ndvi: null, msi: null, evi: null, cloudCover: 100, noData: true };
+      return { ndvi: null, msi: null, evi: null, strMean: null, strMin: null, strMax: null, cloudCover: 100, noData: true };
     }
     const json = await res.json();
     const intervals: any[] = json?.data || [];
-    if (!intervals.length) return { ndvi: null, msi: null, evi: null, cloudCover: 100, noData: true };
+    if (!intervals.length) return { ndvi: null, msi: null, evi: null, strMean: null, strMin: null, strMax: null, cloudCover: 100, noData: true };
 
     // Pick the best daily observation: highest valid-pixel ratio, sensible NDVI
-    let best: { ndvi: number; msi: number | null; evi: number | null; cloudCover: number } | null = null;
+    let best: { ndvi: number; msi: number | null; evi: number | null; strMean: number | null; strMin: number | null; strMax: number | null; cloudCover: number } | null = null;
     let bestValidRatio = -1;
 
     for (const iv of intervals) {
       const ns = iv?.outputs?.ndvi?.bands?.B0?.stats;
       const ms = iv?.outputs?.msi?.bands?.B0?.stats;
       const es = iv?.outputs?.evi?.bands?.B0?.stats;
+      const ss = iv?.outputs?.str?.bands?.B0?.stats;
       if (!ns || ns.sampleCount === 0) continue;
       const validRatio = 1 - (ns.noDataCount / ns.sampleCount);
       if (validRatio < 0.05) continue;  // less than 5% valid pixels — skip
@@ -241,6 +254,13 @@ async function fetchOneWindow(
       const msiMean  = ms?.mean ?? null;
       const eviMean  = es?.mean ?? null;
       if (typeof ndviMean !== "number" || ndviMean < -1.5 || ndviMean > 1.5) continue;
+      // STR stats: min/max/mean over the field's non-cloud, non-oversaturated pixels for this
+      // date. These are the per-date pixel-population extremes used to fit the OPTRAM edges.
+      // Guard against degenerate/blown-up values (STR must be finite and positive).
+      const strValid = ss && typeof ss.mean === "number" && ss.sampleCount > 0 && ss.sampleCount > (ss.noDataCount ?? 0);
+      const strMean = strValid && ss.mean > 0 && ss.mean < 1000 ? ss.mean : null;
+      const strMin  = strValid && typeof ss.min === "number" && ss.min > 0 && ss.min < 1000 ? ss.min : null;
+      const strMax  = strValid && typeof ss.max === "number" && ss.max > 0 && ss.max < 1000 ? ss.max : null;
       if (validRatio > bestValidRatio) {
         bestValidRatio = validRatio;
         best = {
@@ -249,18 +269,113 @@ async function fetchOneWindow(
                 ? Math.round(msiMean * 1000) / 1000 : null,
           evi:  (typeof eviMean === "number" && eviMean > -1.5 && eviMean < 1.5)
                 ? Math.round(eviMean * 1000) / 1000 : null,
+          strMean, strMin, strMax,
           cloudCover: Math.round((1 - validRatio) * 100)
         };
       }
     }
 
-    if (!best) return { ndvi: null, msi: null, evi: null, cloudCover: 100, noData: true };
+    if (!best) return { ndvi: null, msi: null, evi: null, strMean: null, strMin: null, strMax: null, cloudCover: 100, noData: true };
     return { ...best, noData: false };
 
   } catch (err) {
     console.warn("Stats API window fetch error:", err);
-    return { ndvi: null, msi: null, evi: null, cloudCover: 100, noData: true };
+    return { ndvi: null, msi: null, evi: null, strMean: null, strMin: null, strMax: null, cloudCover: 100, noData: true };
   }
+}
+
+// ─── OPTRAM soil-moisture calibration ─────────────────────────────────────
+// The Optical Trapezoid Model estimates a relative soil-wetness index W in [0,1] from the
+// SWIR-Transformed-Reflectance (STR) vs NDVI feature space. W = 0 on the "dry edge" and
+// W = 1 on the "wet edge" of the trapezoid. The edges are calibrated per analysis request
+// (dynamic calibration) because this site has no pre-fitted trapezoid parameters.
+//
+// Because the existing pipeline is built on the Sentinel Hub *Statistics* API (which returns
+// per-date aggregate stats over the field's pixel population, not raw per-pixel arrays), the
+// STR-vs-NDVI edge candidates are drawn from each acquisition date's pixel-population extremes:
+// for every date we already have that date's per-pixel STR min / max / mean and NDVI mean.
+// Following the standard OPTRAM edge-fitting recipe, we bin these candidates by NDVI (20 bins),
+// take the minimum STR per bin as the dry-edge candidate and the maximum STR per bin as the
+// wet-edge candidate, then linear-regress each candidate set to obtain the edge lines
+// STR_dry = i_dry + s_dry*NDVI and STR_wet = i_wet + s_wet*NDVI.
+const OPTRAM_NDVI_BINS = 20;
+// Oversaturation ceiling: W is conceptually in [0,1]. We keep a small 5% margin (W <= 1.05) to
+// tolerate edge-fit / sensor noise on genuinely-wet pixels, but discard anything above it as an
+// oversaturated / non-physical value. Negative W (below the dry edge) is likewise discarded.
+const OPTRAM_W_CEILING = 1.05;
+
+function linearFit(pts: { x: number; y: number }[]): { slope: number; intercept: number } | null {
+  const n = pts.length;
+  if (n < 2) return null;
+  let sx = 0, sy = 0, sxx = 0, sxy = 0;
+  for (const p of pts) { sx += p.x; sy += p.y; sxx += p.x * p.x; sxy += p.x * p.y; }
+  const denom = n * sxx - sx * sx;
+  if (Math.abs(denom) < 1e-9) return null; // all NDVI identical — can't fit a slope
+  const slope = (n * sxy - sx * sy) / denom;
+  const intercept = (sy - slope * sx) / n;
+  return { slope, intercept };
+}
+
+type OptramSample = { ndvi: number; strMean: number | null; strMin: number | null; strMax: number | null };
+
+// Returns a per-sample array of soil-moisture W values (null where unavailable / filtered out),
+// aligned by index with the input samples.
+function computeOptramSoilMoisture(samples: OptramSample[]): (number | null)[] {
+  const usable = samples.filter(
+    s => typeof s.ndvi === "number" && s.strMin !== null && s.strMax !== null && s.strMean !== null
+  );
+  // Need a spread of NDVI values to fit sloped edges; otherwise fall back to flat edges.
+  if (usable.length < 2) return samples.map(() => null);
+
+  const ndviVals = usable.map(s => s.ndvi);
+  const ndviLo = Math.min(...ndviVals);
+  const ndviHi = Math.max(...ndviVals);
+  const span = ndviHi - ndviLo;
+
+  let dryFit: { slope: number; intercept: number } | null = null;
+  let wetFit: { slope: number; intercept: number } | null = null;
+
+  if (span > 1e-4) {
+    // Bin NDVI into OPTRAM_NDVI_BINS intervals; per bin take min STR (dry) and max STR (wet).
+    const binW = span / OPTRAM_NDVI_BINS;
+    const dryBins = new Map<number, { xSum: number; cnt: number; y: number }>();
+    const wetBins = new Map<number, { xSum: number; cnt: number; y: number }>();
+    for (const s of usable) {
+      let bi = Math.floor((s.ndvi - ndviLo) / binW);
+      if (bi >= OPTRAM_NDVI_BINS) bi = OPTRAM_NDVI_BINS - 1;
+      const d = dryBins.get(bi);
+      if (!d) dryBins.set(bi, { xSum: s.ndvi, cnt: 1, y: s.strMin! });
+      else { d.xSum += s.ndvi; d.cnt += 1; d.y = Math.min(d.y, s.strMin!); }
+      const w = wetBins.get(bi);
+      if (!w) wetBins.set(bi, { xSum: s.ndvi, cnt: 1, y: s.strMax! });
+      else { w.xSum += s.ndvi; w.cnt += 1; w.y = Math.max(w.y, s.strMax!); }
+    }
+    const dryPts = Array.from(dryBins.values()).map(b => ({ x: b.xSum / b.cnt, y: b.y }));
+    const wetPts = Array.from(wetBins.values()).map(b => ({ x: b.xSum / b.cnt, y: b.y }));
+    dryFit = linearFit(dryPts);
+    wetFit = linearFit(wetPts);
+  }
+
+  // Flat-edge fallback: if edges can't be sloped (too few distinct NDVI bins), use the global
+  // min/max STR across the analysis as horizontal dry/wet edges.
+  if (!dryFit || !wetFit) {
+    const allMin = Math.min(...usable.map(s => s.strMin!));
+    const allMax = Math.max(...usable.map(s => s.strMax!));
+    dryFit = { slope: 0, intercept: allMin };
+    wetFit = { slope: 0, intercept: allMax };
+  }
+
+  return samples.map(s => {
+    if (typeof s.ndvi !== "number" || s.strMean === null) return null;
+    const strDry = dryFit!.intercept + dryFit!.slope * s.ndvi;
+    const strWet = wetFit!.intercept + wetFit!.slope * s.ndvi;
+    const denom = strWet - strDry;
+    if (!(denom > 1e-6)) return null; // degenerate trapezoid at this NDVI
+    const w = (s.strMean - strDry) / denom;
+    // Physical-plausibility filter: drop negatives and oversaturated (> ceiling) values.
+    if (!(w >= 0) || w > OPTRAM_W_CEILING) return null;
+    return Math.round(w * 1000) / 1000;
+  });
 }
 
 // ─── Main SentinelHub real-data function: iterate bi-weekly windows ────────
@@ -269,7 +384,7 @@ async function fetchSentinelHubData(
   dateFrom: string,
   dateTo: string,
   cloudCoverMax: number
-): Promise<{ ndvi: number; ndwi: number; evi: number | null; cloudCover: number; isWater: boolean; date: string; dataSource: string }[]> {
+): Promise<{ ndvi: number; ndwi: number; evi: number | null; soilMoisture: number | null; cloudCover: number; isWater: boolean; date: string; dataSource: string }[]> {
 
   const token = await getSentinelToken();
   if (!token) {
@@ -300,15 +415,19 @@ async function fetchSentinelHubData(
     })
   );
 
-  const results: { ndvi: number; ndwi: number; evi: number | null; cloudCover: number; isWater: boolean; date: string; dataSource: string }[] = [];
+  // Carry per-date STR stats alongside the observation so OPTRAM can be calibrated after all
+  // windows return. `soilMoisture` is filled in once the trapezoid edges are fit across dates.
+  type Obs = { ndvi: number; ndwi: number; evi: number | null; soilMoisture: number | null; cloudCover: number; isWater: boolean; date: string; dataSource: string; _strMean: number | null; _strMin: number | null; _strMax: number | null };
+  const results: Obs[] = [];
   let realDataCount = 0;
 
   for (const { win, result } of windowResults) {
     if (result.noData || result.ndvi === null) {
-      // No usable data for this window — fill with a simulation estimate
+      // No usable data for this window — fill with a simulation estimate.
+      // Soil moisture is left null (no real STR) rather than fabricated for gap-filled dates.
       const simPts = simulateTimeSeries(coordinates, win.mid, win.mid);
       if (simPts.length > 0) {
-        results.push({ ...simPts[0], date: win.mid, dataSource: "Estimated (cloud gap)" });
+        results.push({ ...simPts[0], date: win.mid, dataSource: "Estimated (cloud gap)", soilMoisture: null, _strMean: null, _strMin: null, _strMax: null });
       }
     } else {
       realDataCount++;
@@ -320,9 +439,13 @@ async function fetchSentinelHubData(
         ndvi: result.ndvi,
         ndwi: msiVal,
         evi: result.evi ?? null,
+        soilMoisture: null,
         cloudCover: result.cloudCover,
         isWater,
-        dataSource: source
+        dataSource: source,
+        _strMean: result.strMean,
+        _strMin: result.strMin,
+        _strMax: result.strMax
       });
     }
   }
@@ -330,11 +453,25 @@ async function fetchSentinelHubData(
   // If we got zero real results, fall back to full simulation
   if (realDataCount === 0) {
     console.warn("Zero real Sentinel-2 results — falling back to simulation");
-    return simulateTimeSeries(coordinates, dateFrom, dateTo);
+    return simulateTimeSeries(coordinates, dateFrom, dateTo).map((d: any) => ({ ...d, soilMoisture: null }));
   }
 
+  // ── OPTRAM dynamic calibration across all real dates in this analysis ──
+  // Water pixels (very low MSI) are excluded from soil-moisture estimation, matching how the
+  // rest of the pipeline treats open-water observations.
+  const optramSamples: OptramSample[] = results.map(r =>
+    (r.isWater || r.dataSource.startsWith("Estimated"))
+      ? { ndvi: r.ndvi, strMean: null, strMin: null, strMax: null }
+      : { ndvi: r.ndvi, strMean: r._strMean, strMin: r._strMin, strMax: r._strMax }
+  );
+  const wValues = computeOptramSoilMoisture(optramSamples);
+  results.forEach((r, i) => { r.soilMoisture = wValues[i]; });
+
   console.log(`Sentinel-2 fetch done: ${realDataCount}/${windows.length} windows with real data`);
-  return results.sort((a, b) => a.date.localeCompare(b.date));
+  // Strip internal STR carriers before returning the stored/serialized series.
+  return results
+    .map(({ _strMean, _strMin, _strMax, ...rest }) => rest)
+    .sort((a, b) => a.date.localeCompare(b.date));
 }
 
 // ─── Bi-weekly simulation: one obs every ~14 days between dateFrom/dateTo ──

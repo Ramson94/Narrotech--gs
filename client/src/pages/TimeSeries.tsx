@@ -82,12 +82,13 @@ function getDefaultDates() {
 // ── Download helpers ──────────────────────────────────────────────────────────
 
 function downloadCSV(data: any[], fieldName: string, dateFrom: string, dateTo: string) {
-  const headers = ["Date", "NDVI", "MSI", "EVI", "Cloud Cover (%)", "Status", "Data Source"];
+  const headers = ["Date", "NDVI", "MSI", "EVI", "Soil Moisture (OPTRAM)", "Cloud Cover (%)", "Status", "Data Source"];
   const rows = [...data].reverse().map(d => [
     d.date,
     d.NDVI !== null && d.NDVI !== undefined ? d.NDVI.toFixed(3) : "",
     d.MSI !== null && d.MSI !== undefined ? d.MSI.toFixed(3) : "",
     d.EVI !== null && d.EVI !== undefined ? d.EVI.toFixed(3) : "",
+    d["Soil Moisture (OPTRAM)"] !== null && d["Soil Moisture (OPTRAM)"] !== undefined ? d["Soil Moisture (OPTRAM)"].toFixed(3) : "",
     d.cloudCover ?? "",
     d.excluded ? "Cloudy-excluded" : d.isWater ? "Open water-removed" : "Valid",
     d.dataSource ?? "",
@@ -291,6 +292,7 @@ export default function TimeSeries() {
     NDVI: d.excluded || d.isWater ? null : d.ndvi,
     MSI: d.excluded || d.isWater ? null : d.ndwi,
     EVI: d.excluded || d.isWater ? null : (d.evi ?? null),
+    "Soil Moisture (OPTRAM)": d.excluded || d.isWater ? null : (d.soilMoisture ?? null),
     cloudCover: d.cloudCover,
     excluded: d.excluded,
     isWater: d.isWater,
@@ -496,6 +498,7 @@ export default function TimeSeries() {
                 <span className="flex items-center gap-1.5"><span className="w-3 h-1 rounded bg-emerald-500 inline-block" />NDVI</span>
                 <span className="flex items-center gap-1.5"><span className="w-3 h-1 rounded bg-blue-500 inline-block" />MSI</span>
                 <span className="flex items-center gap-1.5"><span className="w-3 h-1 rounded bg-purple-500 inline-block" />EVI</span>
+                <span className="flex items-center gap-1.5"><span className="w-3 h-1 rounded bg-teal-500 inline-block" />Soil Moisture (OPTRAM)</span>
                 <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-orange-400 inline-block" />Cloudy</span>
                 <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-blue-400 inline-block" />Water</span>
               </div>
@@ -597,6 +600,19 @@ export default function TimeSeries() {
                     name="EVI"
                     strokeDasharray="5 2"
                   />
+
+                  {/* Soil Moisture (OPTRAM) line — teal */}
+                  <Line
+                    type="monotone"
+                    dataKey="Soil Moisture (OPTRAM)"
+                    stroke="#14b8a6"
+                    strokeWidth={2.5}
+                    dot={{ fill: "#14b8a6", r: 3, strokeWidth: 0 }}
+                    activeDot={{ r: 5, fill: "#14b8a6" }}
+                    connectNulls={false}
+                    name="Soil Moisture (OPTRAM)"
+                    strokeDasharray="6 3"
+                  />
                 </ComposedChart>
               </ResponsiveContainer>
             </div>
@@ -639,6 +655,7 @@ export default function TimeSeries() {
                     <th className="text-right py-2 pr-4 text-muted-foreground font-medium">NDVI</th>
                     <th className="text-right py-2 pr-4 text-muted-foreground font-medium">MSI</th>
                     <th className="text-right py-2 pr-4 text-muted-foreground font-medium">EVI</th>
+                    <th className="text-right py-2 pr-4 text-muted-foreground font-medium">Soil Moisture</th>
                     <th className="text-right py-2 pr-4 text-muted-foreground font-medium">Cloud %</th>
                     <th className="text-left py-2 text-muted-foreground font-medium">Status</th>
                   </tr>
@@ -655,6 +672,9 @@ export default function TimeSeries() {
                       </td>
                       <td className="py-1.5 pr-4 text-right font-mono text-purple-600 dark:text-purple-400">
                         {d.EVI !== null && d.EVI !== undefined ? d.EVI.toFixed(3) : "—"}
+                      </td>
+                      <td className="py-1.5 pr-4 text-right font-mono text-teal-600 dark:text-teal-400">
+                        {d["Soil Moisture (OPTRAM)"] !== null && d["Soil Moisture (OPTRAM)"] !== undefined ? d["Soil Moisture (OPTRAM)"].toFixed(3) : "—"}
                       </td>
                       <td className="py-1.5 pr-4 text-right">
                         <span className={d.cloudCover > cloudCoverMax ? "text-orange-500 font-semibold" : "text-muted-foreground"}>
