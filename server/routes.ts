@@ -285,6 +285,25 @@ const OPTRAM_MIN_BIN_PIXELS = 5;      // ignore sparse NDVI bins whose STR extre
 // tolerate edge-fit / sensor noise on genuinely-wet pixels, but discard anything above it as an
 // oversaturated / non-physical value. Negative W (below the dry edge) is likewise discarded.
 const OPTRAM_W_CEILING = 1.05;
+// ── Outlier-robustness for the STR-vs-NDVI edge fit ──
+// STR = (1-ρswir)²/(2ρswir) diverges as ρswir → 0, so pixels with tiny SWIR reflectance produce
+// huge STR values that are sensor/atmospheric artifacts, not real wet soil. Two independent guards
+// keep them out of the edge fit:
+//   • SWIR reflectance floor (evalscript): ρswir must exceed OPTRAM_SWIR_FLOOR. At ρ = 0.05, STR ≈
+//     9.0, so 0.05 is the lowest floor that even begins to bound STR; combined with the STR ceiling
+//     below it removes near-saturated pixels while keeping genuine bright/dry soil (ρswir ≈ 0.15–0.35).
+//   • Hard STR ceiling (pool filter): any pixel with STR > OPTRAM_STR_CEILING is dropped. OPTRAM
+//     literature (Sadeghi et al. 2017) places real dry→wet soil/vegetation STR roughly in 0–3;
+//     5 is a generous margin, so STR > 5 (ρswir ≲ 0.084) is treated as an artifact. This is the
+//     binding guard that previously let the wet edge run away to ≈8–10.
+const OPTRAM_SWIR_FLOOR = 0.05;
+const OPTRAM_STR_CEILING = 5;
+// Per-NDVI-bin edge candidates use robust percentiles instead of the raw min/max, which are
+// maximally sensitive to a single bad pixel. The wet edge uses the 98th percentile of STR in each
+// bin and the dry edge the 2nd percentile — capturing the true edges of the point cloud without
+// chasing lone outliers.
+const OPTRAM_WET_PCTL = 0.98;
+const OPTRAM_DRY_PCTL = 0.02;
 // Native SWIR (B11) resolution is 20 m. We request the raster at ~20 m/pixel but cap each
 // dimension at OPTRAM_MAX_DIM so a large field can't produce a huge payload / slow request. At the
 // cap the decompressed raster is ≤ 1024·1024·3·4 ≈ 12 MB and the request stays well within the
@@ -407,9 +426,10 @@ async function fetchOptramRaster(
     "  var n = s.B08, r = s.B04, sw = s.B11;",
     "  var d = n + r;",
     "  var ndvi = d < 0.01 ? 0 : (n - r) / d;",
-    // STR = (1 - ρswir)^2 / (2 ρswir); oversaturation floor ρswir < 0.01 (1% reflectance) → invalid.
-    "  var str = sw < 0.01 ? 0 : ((1 - sw) * (1 - sw)) / (2 * sw);",
-    "  var mask = (bad === 1 || d < 0.01 || sw < 0.01) ? 0 : 1;",
+    // STR = (1 - ρswir)^2 / (2 ρswir); tightened oversaturation floor ρswir < 0.05 (5% reflectance).
+    // Below this STR exceeds ~9 and is dominated by near-saturation artifacts (see OPTRAM_SWIR_FLOOR).
+    `  var str = sw < ${OPTRAM_SWIR_FLOOR} ? 0 : ((1 - sw) * (1 - sw)) / (2 * sw);`,
+    `  var mask = (bad === 1 || d < 0.01 || sw < ${OPTRAM_SWIR_FLOOR}) ? 0 : 1;`,
     "  return [ndvi, str, mask];",
     "}"
   ].join("\n");
@@ -456,6 +476,7 @@ async function fetchOptramRaster(
       const ndvi = data[i], str = data[i + 1], mask = data[i + 2];
       if (mask !== 1) continue;
       if (!(str > 0) || !isFinite(str)) continue;
+      if (str > OPTRAM_STR_CEILING) continue; // near-zero-SWIR artifact — never real wet soil
       if (!(ndvi >= -1 && ndvi <= 1)) continue;
       px.push({ ndvi, str });
     }
@@ -466,18 +487,29 @@ async function fetchOptramRaster(
   }
 }
 
+// Percentile of a numeric array (p in [0,1]); sorts in place. Returns 0 for an empty array.
+function percentile(vals: number[], p: number): number {
+  const n = vals.length;
+  if (n === 0) return 0;
+  vals.sort((a, b) => a - b);
+  const idx = Math.min(n - 1, Math.max(0, Math.round(p * (n - 1))));
+  return vals[idx];
+}
+
 // Fit the dry/wet trapezoid edges from a pooled per-pixel (NDVI, STR) cloud. Bins NDVI into
-// OPTRAM_NDVI_BINS intervals, uses the min STR per (sufficiently populated) bin as the dry-edge
-// candidate and the max STR as the wet-edge candidate, then linear-regresses each set. Falls back
-// to flat edges (global STR min/max) if NDVI has too little spread to fit a slope.
+// OPTRAM_NDVI_BINS intervals; per (sufficiently populated) bin the dry-edge candidate is the low
+// STR percentile and the wet-edge candidate the high STR percentile, then each candidate set is
+// linear-regressed. Using percentiles instead of raw min/max makes the fit robust to the residual
+// near-zero-SWIR outliers that previously dragged the wet edge out to STR ≈ 8–10. Falls back to
+// flat percentile edges if NDVI has too little spread to fit a slope. Returns null (no soil
+// moisture for this analysis) if the pool is too small or the resulting trapezoid fails a physical
+// sanity check.
 function fitOptramEdges(pool: PixelSample[]): { dry: { slope: number; intercept: number }; wet: { slope: number; intercept: number } } | null {
   if (pool.length < OPTRAM_MIN_BIN_PIXELS * 2) return null;
-  let ndviLo = Infinity, ndviHi = -Infinity, strLo = Infinity, strHi = -Infinity;
+  let ndviLo = Infinity, ndviHi = -Infinity;
   for (const p of pool) {
     if (p.ndvi < ndviLo) ndviLo = p.ndvi;
     if (p.ndvi > ndviHi) ndviHi = p.ndvi;
-    if (p.str < strLo) strLo = p.str;
-    if (p.str > strHi) strHi = p.str;
   }
   const span = ndviHi - ndviLo;
 
@@ -486,32 +518,55 @@ function fitOptramEdges(pool: PixelSample[]): { dry: { slope: number; intercept:
 
   if (span > 1e-3) {
     const binW = span / OPTRAM_NDVI_BINS;
-    const bins = new Map<number, { xSum: number; cnt: number; min: number; max: number }>();
+    const bins = new Map<number, { xSum: number; strs: number[] }>();
     for (const p of pool) {
       let bi = Math.floor((p.ndvi - ndviLo) / binW);
       if (bi >= OPTRAM_NDVI_BINS) bi = OPTRAM_NDVI_BINS - 1;
       const b = bins.get(bi);
-      if (!b) bins.set(bi, { xSum: p.ndvi, cnt: 1, min: p.str, max: p.str });
-      else { b.xSum += p.ndvi; b.cnt += 1; if (p.str < b.min) b.min = p.str; if (p.str > b.max) b.max = p.str; }
+      if (!b) bins.set(bi, { xSum: p.ndvi, strs: [p.str] });
+      else { b.xSum += p.ndvi; b.strs.push(p.str); }
     }
     const dryPts: { x: number; y: number }[] = [];
     const wetPts: { x: number; y: number }[] = [];
     for (const b of Array.from(bins.values())) {
-      if (b.cnt < OPTRAM_MIN_BIN_PIXELS) continue; // sparse bin — extremes are unreliable
-      const x = b.xSum / b.cnt;
-      dryPts.push({ x, y: b.min });
-      wetPts.push({ x, y: b.max });
+      if (b.strs.length < OPTRAM_MIN_BIN_PIXELS) continue; // sparse bin — percentiles unreliable
+      const x = b.xSum / b.strs.length;
+      dryPts.push({ x, y: percentile(b.strs, OPTRAM_DRY_PCTL) });
+      wetPts.push({ x, y: percentile(b.strs, OPTRAM_WET_PCTL) });
     }
     dryFit = linearFit(dryPts);
     wetFit = linearFit(wetPts);
   }
 
   if (!dryFit || !wetFit) {
-    // Flat-edge fallback: horizontal dry/wet edges at the pooled STR extremes.
-    if (!(strHi > strLo)) return null;
-    dryFit = { slope: 0, intercept: strLo };
-    wetFit = { slope: 0, intercept: strHi };
+    // Flat-edge fallback: horizontal dry/wet edges at the pooled STR percentiles (still robust).
+    const allStr = pool.map(p => p.str);
+    const lo = percentile(allStr, OPTRAM_DRY_PCTL);
+    const hi = percentile(allStr, OPTRAM_WET_PCTL);
+    if (!(hi > lo)) return null;
+    dryFit = { slope: 0, intercept: lo };
+    wetFit = { slope: 0, intercept: hi };
   }
+
+  // ── Physical sanity check on the fitted trapezoid ──
+  // Evaluate both edges across the real NDVI range. The wet edge must sit above the dry edge, and —
+  // because every pooled pixel already satisfies STR ≤ OPTRAM_STR_CEILING — a wet edge that
+  // extrapolates far beyond that ceiling means the regression is still being distorted; refuse to
+  // emit (likely-garbage) soil moisture rather than silently returning it.
+  const strDry = (ndvi: number) => dryFit!.intercept + dryFit!.slope * ndvi;
+  const strWet = (ndvi: number) => wetFit!.intercept + wetFit!.slope * ndvi;
+  const wetLo = strWet(ndviLo), wetHi = strWet(ndviHi);
+  const spanLo = wetLo - strDry(ndviLo), spanHi = wetHi - strDry(ndviHi);
+  const wetMax = Math.max(wetLo, wetHi);
+  if (!(spanLo > 1e-3) && !(spanHi > 1e-3)) {
+    console.warn(`OPTRAM: degenerate trapezoid (wet≈dry across NDVI ${ndviLo.toFixed(3)}–${ndviHi.toFixed(3)}) — soil moisture unavailable`);
+    return null;
+  }
+  if (wetMax > OPTRAM_STR_CEILING * 1.5) {
+    console.warn(`OPTRAM: wet edge STR=${wetMax.toFixed(2)} exceeds ${(OPTRAM_STR_CEILING * 1.5).toFixed(1)} across NDVI range — fit still outlier-distorted, soil moisture unavailable`);
+    return null;
+  }
+  console.log(`OPTRAM edges — dry: STR=${dryFit.intercept.toFixed(4)}${dryFit.slope >= 0 ? "+" : ""}${dryFit.slope.toFixed(4)}·NDVI  wet: STR=${wetFit.intercept.toFixed(4)}${wetFit.slope >= 0 ? "+" : ""}${wetFit.slope.toFixed(4)}·NDVI  |  over NDVI ${ndviLo.toFixed(3)}–${ndviHi.toFixed(3)}: STR_dry=${strDry(ndviLo).toFixed(3)}–${strDry(ndviHi).toFixed(3)}, STR_wet=${wetLo.toFixed(3)}–${wetHi.toFixed(3)}`);
   return { dry: dryFit, wet: wetFit };
 }
 
@@ -626,14 +681,14 @@ async function fetchSentinelHubData(
   for (const px of rasterByIndex) for (const p of px) pool.push(p);
   console.log(`OPTRAM pooled ${pool.length} valid per-pixel (NDVI,STR) pairs across ${rasterByIndex.filter(p => p.length).length} dates`);
 
+  // fitOptramEdges logs the fitted edges + their STR range and rejects outlier-distorted fits.
   const edges = fitOptramEdges(pool);
   if (edges) {
-    console.log(`OPTRAM edges — dry: STR=${edges.dry.intercept.toFixed(4)}${edges.dry.slope >= 0 ? "+" : ""}${edges.dry.slope.toFixed(4)}·NDVI  wet: STR=${edges.wet.intercept.toFixed(4)}${edges.wet.slope >= 0 ? "+" : ""}${edges.wet.slope.toFixed(4)}·NDVI`);
     results.forEach((r, i) => {
       r.soilMoisture = rasterByIndex[i].length ? optramDateMoisture(rasterByIndex[i], edges) : null;
     });
   } else {
-    console.warn("OPTRAM: insufficient pooled pixels to fit edges — soil moisture unavailable");
+    console.warn("OPTRAM: could not fit valid trapezoid edges — soil moisture unavailable");
   }
 
   console.log(`Sentinel-2 fetch done: ${realDataCount}/${windows.length} windows with real data`);
