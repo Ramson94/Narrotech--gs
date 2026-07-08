@@ -149,16 +149,13 @@ async function fetchOneWindow(
   winFrom: string,
   winTo: string,
   cloudCoverMax: number
-): Promise<{ ndvi: number | null; msi: number | null; evi: number | null; strMean: number | null; strMin: number | null; strMax: number | null; cloudCover: number; noData: boolean }> {
+): Promise<{ ndvi: number | null; msi: number | null; evi: number | null; cloudCover: number; noData: boolean }> {
 
-  // Build evalscript as array-join to avoid template literal serialization issues with esbuild
-  // NOTE: an additional 'str' output is added for OPTRAM soil-moisture. It reuses the SAME
-  // SCL cloud mask, the SAME already-loaded SWIR band (B11) as MSI, and the SAME reflectance
-  // scale (Sentinel-2 L2A reflectance is delivered as a 0-1 fraction here, so no /10000 is
-  // applied — matching the existing NDVI/MSI math). NDVI/MSI/EVI outputs are left untouched.
-  // Oversaturated SWIR pixels (ρswir at/near 0) blow STR toward infinity, so we emit NaN for
-  // them; the Sentinel Hub Statistics API automatically excludes NaN pixels from the STR
-  // statistics WITHOUT affecting the shared dataMask (i.e. NDVI/MSI stats are unchanged).
+  // Build evalscript as array-join to avoid template literal serialization issues with esbuild.
+  // This Statistics-API call powers NDVI/MSI/EVI only. OPTRAM soil-moisture is NOT computed here
+  // anymore: aggregate per-date stats collapse the whole field to one point per date, which is far
+  // too few samples to fit a physically-meaningful STR-vs-NDVI trapezoid. OPTRAM instead pulls raw
+  // per-pixel rasters from the Process API (see fetchOptramRaster / fitOptramEdges below).
   const evalscript = [
     "//VERSION=3",
     "function setup() {",
@@ -168,7 +165,6 @@ async function fetchOneWindow(
     "      { id: 'ndvi',     bands: 1, sampleType: 'FLOAT32' },",
     "      { id: 'msi',      bands: 1, sampleType: 'FLOAT32' },",
     "      { id: 'evi',      bands: 1, sampleType: 'FLOAT32' },",
-    "      { id: 'str',      bands: 1, sampleType: 'FLOAT32' },",
     "      { id: 'dataMask', bands: 1, sampleType: 'UINT8'   }",
     "    ],",
     "    mosaicking: 'SIMPLE'",
@@ -176,16 +172,13 @@ async function fetchOneWindow(
     "}",
     "function evaluatePixel(s) {",
     "  var scl = s.SCL;",
-    "  if ([8,9,10,3].includes(scl) || scl === 6) return { ndvi:[0], msi:[0], evi:[0], str:[NaN], dataMask:[0] };",
+    "  if ([8,9,10,3].includes(scl) || scl === 6) return { ndvi:[0], msi:[0], evi:[0], dataMask:[0] };",
     "  var n=s.B08, r=s.B04, nir8a=s.B8A, sw=s.B11, b=s.B02;",
     "  var d1=n+r, d2=nir8a;",
-    "  if (d1 < 0.01 || d2 < 0.01) return { ndvi:[0], msi:[0], evi:[0], str:[NaN], dataMask:[0] };",
+    "  if (d1 < 0.01 || d2 < 0.01) return { ndvi:[0], msi:[0], evi:[0], dataMask:[0] };",
     "  var eviDen = n + 6*r - 7.5*b + 1;",
     "  var evi = Math.abs(eviDen) < 0.01 ? 0 : 2.5*(n-r)/eviDen;",
-    // OPTRAM STR = (1 - ρswir)^2 / (2 * ρswir). Guard the oversaturation floor (ρswir < 0.01,
-    // i.e. < 1% reflectance) with NaN so extreme/invalid STR values never enter the statistics.
-    "  var str = (sw < 0.01) ? NaN : ((1 - sw) * (1 - sw)) / (2 * sw);",
-    "  return { ndvi:[(n-r)/d1], msi:[sw/d2], evi:[evi], str:[str], dataMask:[1] };",
+    "  return { ndvi:[(n-r)/d1], msi:[sw/d2], evi:[evi], dataMask:[1] };",
     "}"
   ].join("\n");
 
@@ -209,8 +202,7 @@ async function fetchOneWindow(
     calculations: {
       ndvi: { statistics: { default: {} } },
       msi:  { statistics: { default: {} } },
-      evi:  { statistics: { default: {} } },
-      str:  { statistics: { default: {} } }
+      evi:  { statistics: { default: {} } }
     }
   };
 
@@ -232,21 +224,20 @@ async function fetchOneWindow(
     if (!res.ok) {
       const errText = await res.text();
       console.warn("Stats API error:", res.status, errText.slice(0, 400));
-      return { ndvi: null, msi: null, evi: null, strMean: null, strMin: null, strMax: null, cloudCover: 100, noData: true };
+      return { ndvi: null, msi: null, evi: null, cloudCover: 100, noData: true };
     }
     const json = await res.json();
     const intervals: any[] = json?.data || [];
-    if (!intervals.length) return { ndvi: null, msi: null, evi: null, strMean: null, strMin: null, strMax: null, cloudCover: 100, noData: true };
+    if (!intervals.length) return { ndvi: null, msi: null, evi: null, cloudCover: 100, noData: true };
 
     // Pick the best daily observation: highest valid-pixel ratio, sensible NDVI
-    let best: { ndvi: number; msi: number | null; evi: number | null; strMean: number | null; strMin: number | null; strMax: number | null; cloudCover: number } | null = null;
+    let best: { ndvi: number; msi: number | null; evi: number | null; cloudCover: number } | null = null;
     let bestValidRatio = -1;
 
     for (const iv of intervals) {
       const ns = iv?.outputs?.ndvi?.bands?.B0?.stats;
       const ms = iv?.outputs?.msi?.bands?.B0?.stats;
       const es = iv?.outputs?.evi?.bands?.B0?.stats;
-      const ss = iv?.outputs?.str?.bands?.B0?.stats;
       if (!ns || ns.sampleCount === 0) continue;
       const validRatio = 1 - (ns.noDataCount / ns.sampleCount);
       if (validRatio < 0.05) continue;  // less than 5% valid pixels — skip
@@ -254,13 +245,6 @@ async function fetchOneWindow(
       const msiMean  = ms?.mean ?? null;
       const eviMean  = es?.mean ?? null;
       if (typeof ndviMean !== "number" || ndviMean < -1.5 || ndviMean > 1.5) continue;
-      // STR stats: min/max/mean over the field's non-cloud, non-oversaturated pixels for this
-      // date. These are the per-date pixel-population extremes used to fit the OPTRAM edges.
-      // Guard against degenerate/blown-up values (STR must be finite and positive).
-      const strValid = ss && typeof ss.mean === "number" && ss.sampleCount > 0 && ss.sampleCount > (ss.noDataCount ?? 0);
-      const strMean = strValid && ss.mean > 0 && ss.mean < 1000 ? ss.mean : null;
-      const strMin  = strValid && typeof ss.min === "number" && ss.min > 0 && ss.min < 1000 ? ss.min : null;
-      const strMax  = strValid && typeof ss.max === "number" && ss.max > 0 && ss.max < 1000 ? ss.max : null;
       if (validRatio > bestValidRatio) {
         bestValidRatio = validRatio;
         best = {
@@ -269,40 +253,45 @@ async function fetchOneWindow(
                 ? Math.round(msiMean * 1000) / 1000 : null,
           evi:  (typeof eviMean === "number" && eviMean > -1.5 && eviMean < 1.5)
                 ? Math.round(eviMean * 1000) / 1000 : null,
-          strMean, strMin, strMax,
           cloudCover: Math.round((1 - validRatio) * 100)
         };
       }
     }
 
-    if (!best) return { ndvi: null, msi: null, evi: null, strMean: null, strMin: null, strMax: null, cloudCover: 100, noData: true };
+    if (!best) return { ndvi: null, msi: null, evi: null, cloudCover: 100, noData: true };
     return { ...best, noData: false };
 
   } catch (err) {
     console.warn("Stats API window fetch error:", err);
-    return { ndvi: null, msi: null, evi: null, strMean: null, strMin: null, strMax: null, cloudCover: 100, noData: true };
+    return { ndvi: null, msi: null, evi: null, cloudCover: 100, noData: true };
   }
 }
 
-// ─── OPTRAM soil-moisture calibration ─────────────────────────────────────
+// ─── OPTRAM soil-moisture calibration (per-pixel, Process API) ─────────────
 // The Optical Trapezoid Model estimates a relative soil-wetness index W in [0,1] from the
-// SWIR-Transformed-Reflectance (STR) vs NDVI feature space. W = 0 on the "dry edge" and
-// W = 1 on the "wet edge" of the trapezoid. The edges are calibrated per analysis request
-// (dynamic calibration) because this site has no pre-fitted trapezoid parameters.
+// SWIR-Transformed-Reflectance (STR) vs NDVI feature space. W = 0 on the "dry edge" and W = 1 on
+// the "wet edge" of the trapezoid. Edges are calibrated per analysis request (this site has no
+// pre-fitted trapezoid parameters).
 //
-// Because the existing pipeline is built on the Sentinel Hub *Statistics* API (which returns
-// per-date aggregate stats over the field's pixel population, not raw per-pixel arrays), the
-// STR-vs-NDVI edge candidates are drawn from each acquisition date's pixel-population extremes:
-// for every date we already have that date's per-pixel STR min / max / mean and NDVI mean.
-// Following the standard OPTRAM edge-fitting recipe, we bin these candidates by NDVI (20 bins),
-// take the minimum STR per bin as the dry-edge candidate and the maximum STR per bin as the
-// wet-edge candidate, then linear-regress each candidate set to obtain the edge lines
-// STR_dry = i_dry + s_dry*NDVI and STR_wet = i_wet + s_wet*NDVI.
-const OPTRAM_NDVI_BINS = 20;
+// Correct OPTRAM needs the actual STR-vs-NDVI *point cloud* — thousands of individual pixels — to
+// locate the dry/wet edges. The Statistics API only returns per-date aggregates (one point per
+// date, ~5 total), which cannot define a trapezoid. So soil-moisture is fetched from the Sentinel
+// Hub *Process* API as raw per-pixel FLOAT32 rasters (NDVI, STR, mask). All valid pixels from all
+// acquisition dates are pooled into one dataset, the dry/wet edges are fit on that pool, then a
+// per-pixel W is computed and averaged per date.
+const OPTRAM_NDVI_BINS = 35;          // pooled cloud has thousands of pts → finer binning is justified
+const OPTRAM_MIN_BIN_PIXELS = 5;      // ignore sparse NDVI bins whose STR extremes are just noise
 // Oversaturation ceiling: W is conceptually in [0,1]. We keep a small 5% margin (W <= 1.05) to
 // tolerate edge-fit / sensor noise on genuinely-wet pixels, but discard anything above it as an
 // oversaturated / non-physical value. Negative W (below the dry edge) is likewise discarded.
 const OPTRAM_W_CEILING = 1.05;
+// Native SWIR (B11) resolution is 20 m. We request the raster at ~20 m/pixel but cap each
+// dimension at OPTRAM_MAX_DIM so a large field can't produce a huge payload / slow request. At the
+// cap the decompressed raster is ≤ 1024·1024·3·4 ≈ 12 MB and the request stays well within the
+// 30 s fetch timeout on the free Render instance; fields large enough to hit the cap are simply
+// sampled a little coarser than 20 m, which is fine for a field-mean soil-moisture estimate.
+const OPTRAM_TARGET_METERS = 20;
+const OPTRAM_MAX_DIM = 1024;
 
 function linearFit(pts: { x: number; y: number }[]): { slope: number; intercept: number } | null {
   const n = pts.length;
@@ -316,66 +305,234 @@ function linearFit(pts: { x: number; y: number }[]): { slope: number; intercept:
   return { slope, intercept };
 }
 
-type OptramSample = { ndvi: number; strMean: number | null; strMin: number | null; strMax: number | null };
+type PixelSample = { ndvi: number; str: number };
 
-// Returns a per-sample array of soil-moisture W values (null where unavailable / filtered out),
-// aligned by index with the input samples.
-function computeOptramSoilMoisture(samples: OptramSample[]): (number | null)[] {
-  const usable = samples.filter(
-    s => typeof s.ndvi === "number" && s.strMin !== null && s.strMax !== null && s.strMean !== null
-  );
-  // Need a spread of NDVI values to fit sloped edges; otherwise fall back to flat edges.
-  if (usable.length < 2) return samples.map(() => null);
+// ─── Minimal FLOAT32 GeoTIFF decoder ──────────────────────────────────────
+// Sentinel Hub's Process API returns a big-endian, Deflate-compressed, striped, chunky
+// (interleaved) TIFF with FLOAT32 samples (verified against real output). This reads only the tags
+// we need to pull the interleaved samples back out; it is not a general TIFF library.
+function decodeFloat32Tiff(buf: Buffer): { width: number; height: number; samples: number; data: Float32Array } | null {
+  if (buf.length < 8) return null;
+  const bo = buf.toString("ascii", 0, 2);
+  const le = bo === "II";
+  if (!le && bo !== "MM") return null;
+  const u16 = (o: number) => (le ? buf.readUInt16LE(o) : buf.readUInt16BE(o));
+  const u32 = (o: number) => (le ? buf.readUInt32LE(o) : buf.readUInt32BE(o));
 
-  const ndviVals = usable.map(s => s.ndvi);
-  const ndviLo = Math.min(...ndviVals);
-  const ndviHi = Math.max(...ndviVals);
+  const ifd = u32(4);
+  const nEntries = u16(ifd);
+  const tags = new Map<number, { type: number; count: number; valueOff: number }>();
+  for (let i = 0; i < nEntries; i++) {
+    const e = ifd + 2 + i * 12;
+    tags.set(u16(e), { type: u16(e + 2), count: u32(e + 4), valueOff: e + 8 });
+  }
+  // Short/long array reader (inline when total bytes <= 4, else the field holds an offset).
+  const readNums = (tag: number): number[] => {
+    const t = tags.get(tag);
+    if (!t) return [];
+    const size = t.type === 3 ? 2 : 4; // 3=SHORT, 4=LONG
+    const total = size * t.count;
+    const base = total <= 4 ? t.valueOff : u32(t.valueOff);
+    const out: number[] = [];
+    for (let k = 0; k < t.count; k++) out.push(size === 2 ? u16(base + k * 2) : u32(base + k * 4));
+    return out;
+  };
+
+  const width = readNums(256)[0];
+  const height = readNums(257)[0];
+  const bits = readNums(258);
+  const compression = readNums(259)[0] ?? 1;
+  const spp = readNums(277)[0] ?? 1;
+  const rowsPerStrip = readNums(278)[0] ?? height;
+  const stripOffsets = readNums(273);
+  const stripByteCounts = readNums(279);
+  const sampleFormat = readNums(339);
+  const planar = readNums(284)[0] ?? 1; // 1 = chunky/interleaved (Sentinel Hub uses this)
+
+  if (!width || !height || !spp || !stripOffsets.length) return null;
+  if (!bits.every(b => b === 32)) return null;                 // only FLOAT32 supported
+  if (sampleFormat.length && !sampleFormat.every(s => s === 3)) return null; // 3 = IEEE float
+  if (planar !== 1) return null;
+
+  // Concatenate decompressed strips.
+  const parts: Buffer[] = [];
+  for (let s = 0; s < stripOffsets.length; s++) {
+    const chunk = buf.subarray(stripOffsets[s], stripOffsets[s] + stripByteCounts[s]);
+    if (compression === 8 || compression === 32946) parts.push(zlib.inflateSync(chunk)); // Deflate
+    else if (compression === 1) parts.push(chunk);                                        // uncompressed
+    else return null;                                                                     // unsupported
+  }
+  void rowsPerStrip;
+  const raw = Buffer.concat(parts);
+  const need = width * height * spp * 4;
+  if (raw.length < need) return null;
+
+  const rdFloat = (o: number) => (le ? raw.readFloatLE(o) : raw.readFloatBE(o));
+  const data = new Float32Array(width * height * spp);
+  for (let i = 0; i < data.length; i++) data[i] = rdFloat(i * 4);
+  return { width, height, samples: spp, data };
+}
+
+// Fetch one per-pixel OPTRAM raster (NDVI, STR, validity mask) for a date window and return every
+// valid (non-cloud, non-oversaturated) pixel as an (ndvi, str) pair.
+async function fetchOptramRaster(
+  token: string,
+  bbox: number[],
+  winFrom: string,
+  winTo: string,
+  cloudCoverMax: number
+): Promise<PixelSample[]> {
+  // Output size from the target ground resolution, capped per dimension.
+  const midLat = (bbox[1] + bbox[3]) / 2;
+  const mPerDegLat = 111320;
+  const mPerDegLng = 111320 * Math.cos((midLat * Math.PI) / 180);
+  const wMeters = (bbox[2] - bbox[0]) * mPerDegLng;
+  const hMeters = (bbox[3] - bbox[1]) * mPerDegLat;
+  const width = Math.max(1, Math.min(OPTRAM_MAX_DIM, Math.round(wMeters / OPTRAM_TARGET_METERS)));
+  const height = Math.max(1, Math.min(OPTRAM_MAX_DIM, Math.round(hMeters / OPTRAM_TARGET_METERS)));
+
+  const evalscript = [
+    "//VERSION=3",
+    "function setup() {",
+    "  return {",
+    "    input: [{ bands: ['B04','B08','B11','SCL'] }],",
+    "    output: { bands: 3, sampleType: 'FLOAT32' },",
+    "    mosaicking: 'SIMPLE'",
+    "  };",
+    "}",
+    "function evaluatePixel(s) {",
+    // Reuse the same SCL cloud/shadow/water mask as the rest of the pipeline (3,6,8,9,10).
+    "  var scl = s.SCL;",
+    "  var bad = ([8,9,10,3].includes(scl) || scl === 6) ? 1 : 0;",
+    "  var n = s.B08, r = s.B04, sw = s.B11;",
+    "  var d = n + r;",
+    "  var ndvi = d < 0.01 ? 0 : (n - r) / d;",
+    // STR = (1 - ρswir)^2 / (2 ρswir); oversaturation floor ρswir < 0.01 (1% reflectance) → invalid.
+    "  var str = sw < 0.01 ? 0 : ((1 - sw) * (1 - sw)) / (2 * sw);",
+    "  var mask = (bad === 1 || d < 0.01 || sw < 0.01) ? 0 : 1;",
+    "  return [ndvi, str, mask];",
+    "}"
+  ].join("\n");
+
+  const body = {
+    input: {
+      bounds: { bbox, properties: { crs: "http://www.opengis.net/def/crs/EPSG/0/4326" } },
+      data: [{
+        type: "sentinel-2-l2a",
+        dataFilter: {
+          timeRange: { from: `${winFrom}T00:00:00Z`, to: `${winTo}T23:59:59Z` },
+          maxCloudCoverage: cloudCoverMax,
+          mosaickingOrder: "leastCC"
+        }
+      }]
+    },
+    output: { width, height, responses: [{ identifier: "default", format: { type: "image/tiff" } }] },
+    evalscript
+  };
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    const res = await fetch(SENTINEL_API, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "Accept": "image/tiff"
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    if (!res.ok) {
+      console.warn("OPTRAM raster error:", res.status, (await res.text()).slice(0, 300));
+      return [];
+    }
+    const tiff = decodeFloat32Tiff(Buffer.from(await res.arrayBuffer()));
+    if (!tiff || tiff.samples < 3) return [];
+    const { data, samples } = tiff;
+    const px: PixelSample[] = [];
+    for (let i = 0; i < data.length; i += samples) {
+      const ndvi = data[i], str = data[i + 1], mask = data[i + 2];
+      if (mask !== 1) continue;
+      if (!(str > 0) || !isFinite(str)) continue;
+      if (!(ndvi >= -1 && ndvi <= 1)) continue;
+      px.push({ ndvi, str });
+    }
+    return px;
+  } catch (err) {
+    console.warn("OPTRAM raster fetch error:", err);
+    return [];
+  }
+}
+
+// Fit the dry/wet trapezoid edges from a pooled per-pixel (NDVI, STR) cloud. Bins NDVI into
+// OPTRAM_NDVI_BINS intervals, uses the min STR per (sufficiently populated) bin as the dry-edge
+// candidate and the max STR as the wet-edge candidate, then linear-regresses each set. Falls back
+// to flat edges (global STR min/max) if NDVI has too little spread to fit a slope.
+function fitOptramEdges(pool: PixelSample[]): { dry: { slope: number; intercept: number }; wet: { slope: number; intercept: number } } | null {
+  if (pool.length < OPTRAM_MIN_BIN_PIXELS * 2) return null;
+  let ndviLo = Infinity, ndviHi = -Infinity, strLo = Infinity, strHi = -Infinity;
+  for (const p of pool) {
+    if (p.ndvi < ndviLo) ndviLo = p.ndvi;
+    if (p.ndvi > ndviHi) ndviHi = p.ndvi;
+    if (p.str < strLo) strLo = p.str;
+    if (p.str > strHi) strHi = p.str;
+  }
   const span = ndviHi - ndviLo;
 
   let dryFit: { slope: number; intercept: number } | null = null;
   let wetFit: { slope: number; intercept: number } | null = null;
 
-  if (span > 1e-4) {
-    // Bin NDVI into OPTRAM_NDVI_BINS intervals; per bin take min STR (dry) and max STR (wet).
+  if (span > 1e-3) {
     const binW = span / OPTRAM_NDVI_BINS;
-    const dryBins = new Map<number, { xSum: number; cnt: number; y: number }>();
-    const wetBins = new Map<number, { xSum: number; cnt: number; y: number }>();
-    for (const s of usable) {
-      let bi = Math.floor((s.ndvi - ndviLo) / binW);
+    const bins = new Map<number, { xSum: number; cnt: number; min: number; max: number }>();
+    for (const p of pool) {
+      let bi = Math.floor((p.ndvi - ndviLo) / binW);
       if (bi >= OPTRAM_NDVI_BINS) bi = OPTRAM_NDVI_BINS - 1;
-      const d = dryBins.get(bi);
-      if (!d) dryBins.set(bi, { xSum: s.ndvi, cnt: 1, y: s.strMin! });
-      else { d.xSum += s.ndvi; d.cnt += 1; d.y = Math.min(d.y, s.strMin!); }
-      const w = wetBins.get(bi);
-      if (!w) wetBins.set(bi, { xSum: s.ndvi, cnt: 1, y: s.strMax! });
-      else { w.xSum += s.ndvi; w.cnt += 1; w.y = Math.max(w.y, s.strMax!); }
+      const b = bins.get(bi);
+      if (!b) bins.set(bi, { xSum: p.ndvi, cnt: 1, min: p.str, max: p.str });
+      else { b.xSum += p.ndvi; b.cnt += 1; if (p.str < b.min) b.min = p.str; if (p.str > b.max) b.max = p.str; }
     }
-    const dryPts = Array.from(dryBins.values()).map(b => ({ x: b.xSum / b.cnt, y: b.y }));
-    const wetPts = Array.from(wetBins.values()).map(b => ({ x: b.xSum / b.cnt, y: b.y }));
+    const dryPts: { x: number; y: number }[] = [];
+    const wetPts: { x: number; y: number }[] = [];
+    for (const b of Array.from(bins.values())) {
+      if (b.cnt < OPTRAM_MIN_BIN_PIXELS) continue; // sparse bin — extremes are unreliable
+      const x = b.xSum / b.cnt;
+      dryPts.push({ x, y: b.min });
+      wetPts.push({ x, y: b.max });
+    }
     dryFit = linearFit(dryPts);
     wetFit = linearFit(wetPts);
   }
 
-  // Flat-edge fallback: if edges can't be sloped (too few distinct NDVI bins), use the global
-  // min/max STR across the analysis as horizontal dry/wet edges.
   if (!dryFit || !wetFit) {
-    const allMin = Math.min(...usable.map(s => s.strMin!));
-    const allMax = Math.max(...usable.map(s => s.strMax!));
-    dryFit = { slope: 0, intercept: allMin };
-    wetFit = { slope: 0, intercept: allMax };
+    // Flat-edge fallback: horizontal dry/wet edges at the pooled STR extremes.
+    if (!(strHi > strLo)) return null;
+    dryFit = { slope: 0, intercept: strLo };
+    wetFit = { slope: 0, intercept: strHi };
   }
+  return { dry: dryFit, wet: wetFit };
+}
 
-  return samples.map(s => {
-    if (typeof s.ndvi !== "number" || s.strMean === null) return null;
-    const strDry = dryFit!.intercept + dryFit!.slope * s.ndvi;
-    const strWet = wetFit!.intercept + wetFit!.slope * s.ndvi;
+// Given the fitted edges and a date's valid pixels, compute the mean soil-moisture W over pixels
+// that pass the physical-plausibility filter. Returns null if no pixel is valid.
+function optramDateMoisture(
+  pixels: PixelSample[],
+  edges: { dry: { slope: number; intercept: number }; wet: { slope: number; intercept: number } }
+): number | null {
+  let sum = 0, cnt = 0;
+  for (const p of pixels) {
+    const strDry = edges.dry.intercept + edges.dry.slope * p.ndvi;
+    const strWet = edges.wet.intercept + edges.wet.slope * p.ndvi;
     const denom = strWet - strDry;
-    if (!(denom > 1e-6)) return null; // degenerate trapezoid at this NDVI
-    const w = (s.strMean - strDry) / denom;
-    // Physical-plausibility filter: drop negatives and oversaturated (> ceiling) values.
-    if (!(w >= 0) || w > OPTRAM_W_CEILING) return null;
-    return Math.round(w * 1000) / 1000;
-  });
+    if (!(denom > 1e-6)) continue; // degenerate trapezoid at this NDVI
+    const w = (p.str - strDry) / denom;
+    if (!(w >= 0) || w > OPTRAM_W_CEILING) continue; // drop negatives + oversaturated
+    sum += w; cnt++;
+  }
+  if (cnt === 0) return null;
+  return Math.round((sum / cnt) * 1000) / 1000;
 }
 
 // ─── Main SentinelHub real-data function: iterate bi-weekly windows ────────
@@ -415,19 +572,20 @@ async function fetchSentinelHubData(
     })
   );
 
-  // Carry per-date STR stats alongside the observation so OPTRAM can be calibrated after all
-  // windows return. `soilMoisture` is filled in once the trapezoid edges are fit across dates.
-  type Obs = { ndvi: number; ndwi: number; evi: number | null; soilMoisture: number | null; cloudCover: number; isWater: boolean; date: string; dataSource: string; _strMean: number | null; _strMin: number | null; _strMax: number | null };
+  // Each observation carries the window it came from and whether it is OPTRAM-eligible (real,
+  // non-water), so we can fetch its per-pixel raster and attach soil-moisture once the trapezoid
+  // edges are fit across every date's pooled pixels.
+  type Obs = { ndvi: number; ndwi: number; evi: number | null; soilMoisture: number | null; cloudCover: number; isWater: boolean; date: string; dataSource: string; _win: { from: string; to: string } | null; _cloud: number };
   const results: Obs[] = [];
   let realDataCount = 0;
 
   for (const { win, result } of windowResults) {
     if (result.noData || result.ndvi === null) {
       // No usable data for this window — fill with a simulation estimate.
-      // Soil moisture is left null (no real STR) rather than fabricated for gap-filled dates.
+      // Soil moisture is left null (no real pixels) rather than fabricated for gap-filled dates.
       const simPts = simulateTimeSeries(coordinates, win.mid, win.mid);
       if (simPts.length > 0) {
-        results.push({ ...simPts[0], date: win.mid, dataSource: "Estimated (cloud gap)", soilMoisture: null, _strMean: null, _strMin: null, _strMax: null });
+        results.push({ ...simPts[0], date: win.mid, dataSource: "Estimated (cloud gap)", soilMoisture: null, _win: null, _cloud: cloudCoverMax });
       }
     } else {
       realDataCount++;
@@ -443,9 +601,9 @@ async function fetchSentinelHubData(
         cloudCover: result.cloudCover,
         isWater,
         dataSource: source,
-        _strMean: result.strMean,
-        _strMin: result.strMin,
-        _strMax: result.strMax
+        // Water observations are excluded from soil-moisture, matching the rest of the pipeline.
+        _win: isWater ? null : { from: win.from, to: win.to },
+        _cloud: result.cloudCover > cloudCoverMax ? 50 : cloudCoverMax
       });
     }
   }
@@ -456,21 +614,32 @@ async function fetchSentinelHubData(
     return simulateTimeSeries(coordinates, dateFrom, dateTo).map((d: any) => ({ ...d, soilMoisture: null }));
   }
 
-  // ── OPTRAM dynamic calibration across all real dates in this analysis ──
-  // Water pixels (very low MSI) are excluded from soil-moisture estimation, matching how the
-  // rest of the pipeline treats open-water observations.
-  const optramSamples: OptramSample[] = results.map(r =>
-    (r.isWater || r.dataSource.startsWith("Estimated"))
-      ? { ndvi: r.ndvi, strMean: null, strMin: null, strMax: null }
-      : { ndvi: r.ndvi, strMean: r._strMean, strMin: r._strMin, strMax: r._strMax }
+  // ── OPTRAM per-pixel calibration across all real dates in this analysis ──
+  // Fetch each eligible date's per-pixel raster (NDVI, STR) from the Process API, pool every valid
+  // pixel from every date, fit the dry/wet trapezoid edges on that pool, then compute a per-pixel W
+  // per date and average it. This replaces the previous aggregate-only approach that (mis)fit the
+  // edges on just ~5 per-date mean points.
+  const rasterByIndex = await Promise.all(
+    results.map(async (r) => (r._win ? fetchOptramRaster(token, bbox, r._win.from, r._win.to, r._cloud) : []))
   );
-  const wValues = computeOptramSoilMoisture(optramSamples);
-  results.forEach((r, i) => { r.soilMoisture = wValues[i]; });
+  const pool: PixelSample[] = [];
+  for (const px of rasterByIndex) for (const p of px) pool.push(p);
+  console.log(`OPTRAM pooled ${pool.length} valid per-pixel (NDVI,STR) pairs across ${rasterByIndex.filter(p => p.length).length} dates`);
+
+  const edges = fitOptramEdges(pool);
+  if (edges) {
+    console.log(`OPTRAM edges — dry: STR=${edges.dry.intercept.toFixed(4)}${edges.dry.slope >= 0 ? "+" : ""}${edges.dry.slope.toFixed(4)}·NDVI  wet: STR=${edges.wet.intercept.toFixed(4)}${edges.wet.slope >= 0 ? "+" : ""}${edges.wet.slope.toFixed(4)}·NDVI`);
+    results.forEach((r, i) => {
+      r.soilMoisture = rasterByIndex[i].length ? optramDateMoisture(rasterByIndex[i], edges) : null;
+    });
+  } else {
+    console.warn("OPTRAM: insufficient pooled pixels to fit edges — soil moisture unavailable");
+  }
 
   console.log(`Sentinel-2 fetch done: ${realDataCount}/${windows.length} windows with real data`);
-  // Strip internal STR carriers before returning the stored/serialized series.
+  // Strip internal calibration carriers before returning the stored/serialized series.
   return results
-    .map(({ _strMean, _strMin, _strMax, ...rest }) => rest)
+    .map(({ _win, _cloud, ...rest }) => rest)
     .sort((a, b) => a.date.localeCompare(b.date));
 }
 
