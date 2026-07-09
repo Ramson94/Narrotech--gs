@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { queryClient, apiRequest } from "@/lib/queryClient";
+import { queryClient, apiRequest, runAnalyzeJob } from "@/lib/queryClient";
 import type { Field } from "@shared/schema";
 import { useToast } from "@/hooks/use-toast";
 import { Button } from "@/components/ui/button";
@@ -244,12 +244,7 @@ export default function TimeSeries() {
   const analyzeMutation = useMutation({
     mutationFn: async () => {
       if (!selectedFieldId) throw new Error("No field selected");
-      const res = await apiRequest("POST", `/api/fields/${selectedFieldId}/analyze`, {
-        dateFrom,
-        dateTo,
-        cloudCoverMax,
-      });
-      return res.json();
+      return runAnalyzeJob(Number(selectedFieldId), { dateFrom, dateTo, cloudCoverMax });
     },
     onSuccess: (data) => {
       const ts = data.timeSeriesData || [];

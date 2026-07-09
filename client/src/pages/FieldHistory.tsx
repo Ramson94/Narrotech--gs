@@ -1,5 +1,5 @@
 import { useQuery, useMutation } from "@tanstack/react-query";
-import { queryClient, apiRequest } from "@/lib/queryClient";
+import { queryClient, apiRequest, runAnalyzeJob } from "@/lib/queryClient";
 import type { Field } from "@shared/schema";
 import { useState } from "react";
 import { useToast } from "@/hooks/use-toast";
@@ -72,7 +72,7 @@ export default function FieldHistory() {
   });
 
   const analyzeMutation = useMutation({
-    mutationFn: (id: number) => apiRequest("POST", `/api/fields/${id}/analyze`).then(r => r.json()),
+    mutationFn: (id: number) => runAnalyzeJob(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["/api/fields"] });
       queryClient.invalidateQueries({ queryKey: ["/api/alerts"] });

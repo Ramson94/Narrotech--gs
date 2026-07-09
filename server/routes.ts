@@ -1,6 +1,7 @@
 import type { Express } from "express";
 import { Server } from "http";
 import zlib from "zlib";
+import { randomUUID } from "crypto";
 import { storage } from "./storage";
 import { insertFieldSchema } from "@shared/schema";
 import { generateFieldReport } from "./report";
@@ -830,6 +831,68 @@ function isBiweeklyDue(lastNotifiedAt: string | null): boolean {
   return diffDays >= 14;
 }
 
+// ─── Async analysis job store ──────────────────────────────────────────────
+// The satellite analysis (token + multi-window raster fetches + NDVI/MSI/OPTRAM
+// computation) can take longer than Render's ~30s HTTP proxy timeout. To avoid a
+// killed connection + garbled 502, the POST /analyze endpoint kicks the work off
+// as a background job and the client polls for the result. Single-instance app,
+// so a plain in-memory Map is sufficient (no Redis/queue).
+type AnalyzeJob =
+  | { status: "processing"; createdAt: number }
+  | { status: "done"; createdAt: number; result: unknown }
+  | { status: "error"; createdAt: number; error: string };
+
+const analyzeJobs = new Map<string, AnalyzeJob>();
+const ANALYZE_JOB_TTL_MS = 45 * 60 * 1000; // evict finished/stale jobs after 45 min
+
+function sweepAnalyzeJobs() {
+  const cutoff = Date.now() - ANALYZE_JOB_TTL_MS;
+  analyzeJobs.forEach((job, id) => {
+    if (job.createdAt < cutoff) analyzeJobs.delete(id);
+  });
+}
+setInterval(sweepAnalyzeJobs, 10 * 60 * 1000).unref?.();
+
+// The actual analysis work, extracted so it can run outside the request lifecycle.
+// Returns the exact shape the old synchronous endpoint used to return.
+async function runFieldAnalysis(
+  fieldId: number,
+  opts: { dateFrom: string; dateTo: string; cloudCoverMax: number },
+) {
+  const field = storage.getField(fieldId);
+  if (!field) throw new Error("Field not found");
+
+  const { dateFrom, dateTo, cloudCoverMax } = opts;
+  const coords = JSON.parse(field.coordinates);
+  const timeSeriesData = await fetchSentinelHubData(coords, dateFrom, dateTo, cloudCoverMax);
+  const { ndvi, ndwi, evi, healthScore } = computeAggregates(timeSeriesData);
+
+  const updated = storage.updateField(field.id, {
+    ndvi: ndvi ?? undefined,
+    ndwi: ndwi ?? undefined,
+    evi: evi ?? undefined,
+    healthScore: healthScore ?? undefined,
+    status: healthScore !== null ? (healthScore < 40 ? "alert" : "analyzed") : "analyzed",
+    timeSeriesData: JSON.stringify(timeSeriesData),
+    dateFrom,
+    dateTo,
+    cloudCoverMax,
+    analyzedAt: new Date().toISOString(),
+  });
+
+  // Generate alerts (only if bi-weekly is due)
+  const notifyDue = isBiweeklyDue(field.lastNotifiedAt ?? null);
+  storage.deleteAlertsByField(field.id);
+  const newAlerts = generateAlerts(field.id, ndvi, ndwi, field.name, evi);
+  newAlerts.forEach(a => storage.createAlert(a));
+
+  if (notifyDue) {
+    storage.updateField(field.id, { lastNotifiedAt: new Date().toISOString() });
+  }
+
+  return { field: updated, timeSeriesData, notificationSent: notifyDue };
+}
+
 // ─── Express routes ────────────────────────────────────────────────────────
 export function registerRoutes(httpServer: Server, app: Express) {
   // Keep-alive ping — no auth, just confirms server is up
@@ -863,9 +926,11 @@ export function registerRoutes(httpServer: Server, app: Express) {
     }
   });
 
-  // Analyze field: compute time-series NDVI/MSI over date range
-  app.post("/api/fields/:id/analyze", requireAuth, async (req, res) => {
-    try {
+  // Analyze field: compute time-series NDVI/MSI over date range.
+  // Async pattern: validate + kick off the (potentially slow) satellite work in the
+  // background and immediately return a jobId. The client polls GET /api/analyze-jobs/:jobId.
+  // This keeps every HTTP request short so Render's proxy never times out mid-analysis.
+  app.post("/api/fields/:id/analyze", requireAuth, (req, res) => {
     const field = storage.getField(Number(req.params.id));
     if (!field) return res.status(404).json({ error: "Not found" });
 
@@ -875,38 +940,32 @@ export function registerRoutes(httpServer: Server, app: Express) {
       cloudCoverMax = field.cloudCoverMax ?? 20
     } = req.body || {};
 
-    const coords = JSON.parse(field.coordinates);
-    const timeSeriesData = await fetchSentinelHubData(coords, dateFrom, dateTo, cloudCoverMax);
-    const { ndvi, ndwi, evi, healthScore } = computeAggregates(timeSeriesData);
+    const jobId = randomUUID();
+    analyzeJobs.set(jobId, { status: "processing", createdAt: Date.now() });
 
-    const updated = storage.updateField(field.id, {
-      ndvi: ndvi ?? undefined,
-      ndwi: ndwi ?? undefined,
-      evi: evi ?? undefined,
-      healthScore: healthScore ?? undefined,
-      status: healthScore !== null ? (healthScore < 40 ? "alert" : "analyzed") : "analyzed",
-      timeSeriesData: JSON.stringify(timeSeriesData),
-      dateFrom,
-      dateTo,
-      cloudCoverMax,
-      analyzedAt: new Date().toISOString(),
-    });
+    // Fire-and-forget: run the analysis outside the request lifecycle. Any rejection is
+    // captured as a job error so it never becomes an unhandled rejection / process crash.
+    runFieldAnalysis(field.id, { dateFrom, dateTo, cloudCoverMax })
+      .then(result => {
+        analyzeJobs.set(jobId, { status: "done", createdAt: Date.now(), result });
+      })
+      .catch(err => {
+        console.error("Analyze job error:", err);
+        analyzeJobs.set(jobId, { status: "error", createdAt: Date.now(), error: String(err?.message || err) });
+      });
 
-    // Generate alerts (only if bi-weekly is due)
-    const notifyDue = isBiweeklyDue(field.lastNotifiedAt ?? null);
-    storage.deleteAlertsByField(field.id);
-    const newAlerts = generateAlerts(field.id, ndvi, ndwi, field.name, evi);
-    newAlerts.forEach(a => storage.createAlert(a));
+    res.status(202).json({ jobId, status: "processing" });
+  });
 
-    if (notifyDue) {
-      storage.updateField(field.id, { lastNotifiedAt: new Date().toISOString() });
-    }
-
-    res.json({ field: updated, timeSeriesData, notificationSent: notifyDue });
-    } catch (err) {
-      console.error("Analyze route error:", err);
-      res.status(500).json({ error: "Analysis failed", details: String(err) });
-    }
+  // Poll the status/result of an analysis job started via POST /api/fields/:id/analyze.
+  // Returns { status: "processing" } | { status: "done", result } | { status: "error", error }.
+  app.get("/api/analyze-jobs/:jobId", requireAuth, (req, res) => {
+    sweepAnalyzeJobs(); // lazy cleanup on access, in addition to the periodic sweep
+    const job = analyzeJobs.get(req.params.jobId);
+    if (!job) return res.status(404).json({ error: "Job not found or expired" });
+    if (job.status === "done") return res.json({ status: "done", result: job.result });
+    if (job.status === "error") return res.json({ status: "error", error: job.error });
+    res.json({ status: "processing" });
   });
 
   // Get time-series for a field (with optional date filter)

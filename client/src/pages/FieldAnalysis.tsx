@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { queryClient, apiRequest } from "@/lib/queryClient";
+import { queryClient, apiRequest, runAnalyzeJob } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -383,7 +383,7 @@ export default function FieldAnalysis() {
         notes, dateFrom, dateTo,
         cloudCoverMax: Number(cloudCoverMax),
       }).then(r => r.json());
-      await apiRequest("POST", `/api/fields/${field.id}/analyze`, {
+      await runAnalyzeJob(field.id, {
         dateFrom, dateTo, cloudCoverMax: Number(cloudCoverMax),
       });
       return field;
