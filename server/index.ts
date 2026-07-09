@@ -2,23 +2,13 @@ import "dotenv/config";
 import express, { Response, NextFunction } from 'express';
 import type { Request } from 'express';
 import session from "express-session";
-import Database from "better-sqlite3";
-import sqliteStoreFactory from "better-sqlite3-session-store";
+import createMemoryStore from "memorystore";
 import crypto from "node:crypto";
-import path from "node:path";
-import fs from "node:fs";
 import { registerRoutes } from "./routes";
 import { registerAuthRoutes } from "./auth";
 import { serveStatic } from "./static";
+import { initStorage } from "./storage";
 import { createServer } from "node:http";
-
-function fsExistsSyncSafe(p: string): boolean {
-  try {
-    return fs.existsSync(p);
-  } catch {
-    return false;
-  }
-}
 
 // A missing SESSION_SECRET must never crash the whole server (that took the entire
 // app down with 503s on every route, including login/report/WhatsApp, in production).
@@ -65,48 +55,23 @@ app.use(
 
 app.use(express.urlencoded({ extended: false }));
 
-// ─── Session middleware (SQLite-backed — survives server restarts) ──────────
-// Uses better-sqlite3 (already a required dependency for the main app database)
-// instead of the separate `connect-sqlite3` + `sqlite3` native modules. This
-// avoids a second independent native-module compilation at install time —
-// previously, if that second native build failed in a deployment sandbox
-// (e.g. prebuilt binary download blocked, or node-gyp toolchain unavailable),
-// `npm ci` would fail entirely and the server process would never start,
-// which the platform reports simply as "No service is running on port 5000".
-function resolveSessionDbDir(): string {
-  try {
-    if (process.env.NODE_ENV === "production" && fsExistsSyncSafe("/data")) {
-      fs.accessSync("/data", fs.constants.W_OK);
-      return "/data";
-    }
-  } catch (err) {
-    console.warn("[index] /data exists but is not usable for sessions, falling back to local dir:", err);
-  }
-  return ".";
-}
-
-function openSessionDb(): InstanceType<typeof Database> {
-  const dir = resolveSessionDbDir();
-  const primaryPath = path.join(dir, "sessions.db");
-  try {
-    return new Database(primaryPath);
-  } catch (err) {
-    console.error(`[index] Failed to open session DB at ${primaryPath}, falling back to local sessions.db:`, err);
-    if (primaryPath !== "sessions.db") {
-      return new Database("sessions.db");
-    }
-    throw err;
-  }
-}
-
-const sessionDb = openSessionDb();
-const SqliteSessionStore = sqliteStoreFactory(session);
+// ─── Session middleware (in-memory store — no native module) ────────────────
+// Uses `memorystore`, a pure-JS session store with TTL-based pruning. This
+// replaces the previous `better-sqlite3`-backed store, which pulled in a native
+// C++ addon that must be compiled/loaded at install/startup. If that native
+// build failed in a deployment sandbox (prebuilt binary download blocked, or
+// node-gyp toolchain unavailable), the server process would never start —
+// reported by the platform simply as "No service is running on port 5000".
+// Trade-off: sessions live in process memory and are cleared on restart, so
+// users re-authenticate after a redeploy (already the effective behaviour when
+// SESSION_SECRET is unset, as noted above).
+const MemoryStore = createMemoryStore(session);
 app.use(session({
   name: "__Host-ntgs_session",   // __Host- prefix required so pplx.app's proxy doesn't strip the cookie
   secret: sessionSecret,
   resave: false,
   saveUninitialized: false,
-  store: new SqliteSessionStore({ client: sessionDb, expired: { clear: true, intervalMs: 15 * 60 * 1000 } }),
+  store: new MemoryStore({ checkPeriod: 15 * 60 * 1000 }),
   // credentials:"include" on every fetch means the browser always sends this cookie.
   // SameSite=lax works fine here — the session cookie travels with every request.
   // NOTE: __Host- prefixed cookies require Secure=true and Path="/" with no Domain attribute — always set cookie.secure true regardless of NODE_ENV so it still works when proxied over HTTPS in preview/publish sandboxes.
@@ -151,6 +116,10 @@ app.use((req, res, next) => {
 });
 
 (async () => {
+  // Initialize the sql.js-backed database (loads data.db into memory) before
+  // any request handler can touch storage.
+  await initStorage();
+
   registerAuthRoutes(app);
   await registerRoutes(httpServer, app);
 
