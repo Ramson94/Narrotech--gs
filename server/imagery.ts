@@ -120,3 +120,27 @@ export function gridSize(bbox: number[], targetMeters: number, minDim: number, m
   const clamp = (v: number) => Math.max(minDim, Math.min(maxDim, Math.round(v / targetMeters)));
   return { width: clamp(wM), height: clamp(hM) };
 }
+
+// Ray-casting point-in-polygon test.
+export function pointInPolygon(lat: number, lng: number, coords: LatLng[]): boolean {
+  let inside = false;
+  for (let i = 0, j = coords.length - 1; i < coords.length; j = i++) {
+    const xi = coords[i].lng, yi = coords[i].lat, xj = coords[j].lng, yj = coords[j].lat;
+    if ((yi > lat) !== (yj > lat) && lng < ((xj - xi) * (lat - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+
+// Number of raster cells (of a width x height grid over the field's bounding box) whose centre lies
+// inside the field polygon. The satellite service reports pixels outside the polygon as "no data",
+// so this is the reference count for working out how much of the FIELD itself is really missing.
+export function fieldPixelCount(coords: LatLng[], bbox: number[], width: number, height: number): number {
+  const [minLng, minLat, maxLng, maxLat] = bbox;
+  const dx = (maxLng - minLng) / width, dy = (maxLat - minLat) / height;
+  let n = 0;
+  for (let r = 0; r < height; r++) {
+    const lat = maxLat - (r + 0.5) * dy;
+    for (let c = 0; c < width; c++) if (pointInPolygon(lat, minLng + (c + 0.5) * dx, coords)) n++;
+  }
+  return n;
+}

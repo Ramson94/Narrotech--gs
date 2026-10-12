@@ -8,7 +8,7 @@ import { generateFieldReport } from "./report";
 import { sendWhatsAppNotification, buildWhatsAppMessage } from "./whatsapp";
 import {
   MAX_FIELD_CLOUD_PCT, FALLBACK_DAYS, SCL_CLOUD_CLASSES, SCL_WATER_CLASS,
-  biweeklyWindows, selectImagesForWindows, fieldGeometry, bboxOf, gridSize, addDays,
+  biweeklyWindows, selectImagesForWindows, fieldGeometry, bboxOf, gridSize, addDays, fieldPixelCount,
   type DailyObservation, type LatLng,
 } from "./imagery";
 // ─── Auth middleware (inline to avoid esbuild hoisting issues) ─────────────
@@ -146,12 +146,14 @@ const DAILY_EVALSCRIPT = [
   "  var clear = (!cloud && !water && d1 >= 0.01 && s.B8A >= 0.01) ? 1 : 0;",
   "  var ndvi = clear ? (s.B08 - s.B04) / d1 : 0;",
   "  var msi = clear ? s.B11 / s.B8A : 0;",
-  // dataMask output = 1 for every pixel in the field, so no-data pixels count as cloud.
+  // dataMask output = the input dataMask: 0 for pixels OUTSIDE the field polygon (and for genuinely
+  // missing pixels), so they are left out of the statistics. Missing pixels inside the field are
+  // then counted by comparing the valid-pixel count with the field's own pixel count.
   "  var opaque = !noData && (s.SCL === 8 || s.SCL === 9) ? 1 : 0;",
   "  var cirrus = !noData && s.SCL === 10 ? 1 : 0;",
   "  var shadow = !noData && s.SCL === 3 ? 1 : 0;",
   "  return { ndvi: [ndvi * clear], msi: [msi * clear], clear: [clear], cloud: [cloud ? 1 : 0], water: [water ? 1 : 0],",
-  "           opaque: [opaque], cirrus: [cirrus], shadow: [shadow], nodata: [noData ? 1 : 0], dataMask: [1] };",
+  "           opaque: [opaque], cirrus: [cirrus], shadow: [shadow], nodata: [noData ? 1 : 0], dataMask: [s.dataMask] };",
   "}"
 ].join("\n");
 
@@ -159,8 +161,8 @@ const STATS_CHUNK_DAYS = 60;
 
 class SatelliteServiceError extends Error {}
 
-async function fetchDailyChunk(token: string, geometry: object, bbox: number[], from: string, to: string): Promise<DailyObservation[]> {
-  const { width, height } = gridSize(bbox, 10, 32, 256);
+async function fetchDailyChunk(token: string, geometry: object, bbox: number[], grid: { width: number; height: number; fieldPixels: number }, from: string, to: string): Promise<DailyObservation[]> {
+  const { width, height, fieldPixels } = grid;
   const body = {
     input: {
       bounds: { geometry, properties: { crs: "http://www.opengis.net/def/crs/EPSG/0/4326" } },
@@ -203,20 +205,28 @@ async function fetchDailyChunk(token: string, geometry: object, bbox: number[], 
       for (const iv of intervals) {
         const st = (id: string) => iv?.outputs?.[id]?.bands?.B0?.stats;
         const cloud = st("cloud"), clear = st("clear"), water = st("water");
-        const pct = (x: any) => (typeof x?.mean === "number" ? Math.round(x.mean * 1000) / 10 : 0);
-        if (!cloud || typeof cloud.mean !== "number" || !(cloud.sampleCount > 0)) continue;
-        const clearFrac = typeof clear?.mean === "number" ? clear.mean : 0;
+        if (!cloud || !(cloud.sampleCount > 0)) continue;
+        // Share of the field that actually has data on this date (pixels outside the polygon are
+        // excluded by the service and are NOT missing data).
+        const validPixels = Math.max(0, cloud.sampleCount - (cloud.noDataCount ?? 0));
+        const validFrac = fieldPixels > 0 ? Math.min(1, validPixels / fieldPixels) : (validPixels > 0 ? 1 : 0);
+        const missingFrac = 1 - validFrac;
+        // Statistic means are over valid pixels; convert each to a share of the whole field.
+        const frac = (x: any) => (validFrac > 0 && typeof x?.mean === "number" && isFinite(x.mean) ? x.mean * validFrac : 0);
+        const pct = (f: number) => Math.round(f * 1000) / 10;
+        const clearFrac = validFrac > 0 && typeof clear?.mean === "number" && isFinite(clear.mean) ? clear.mean : 0;
         const ndviSum = st("ndvi")?.mean, msiSum = st("msi")?.mean;
         const ndvi = clearFrac > 0 && typeof ndviSum === "number" ? ndviSum / clearFrac : null;
         const msi = clearFrac > 0 && typeof msiSum === "number" ? msiSum / clearFrac : null;
         out.push({
           date: String(iv.interval?.from || "").slice(0, 10),
-          cloudPct: Math.round(cloud.mean * 1000) / 10,
-          waterPct: Math.round((water?.mean ?? 0) * 1000) / 10,
+          cloudPct: pct(Math.min(1, frac(cloud) + missingFrac)),
+          waterPct: pct(frac(water)),
           ndvi: ndvi !== null && ndvi >= -1 && ndvi <= 1 ? Math.round(ndvi * 1000) / 1000 : null,
           msi: msi !== null && msi > 0 && msi < 10 ? Math.round(msi * 1000) / 1000 : null,
           breakdown: {
-            opaque: pct(st("opaque")), cirrus: pct(st("cirrus")), shadow: pct(st("shadow")), noData: pct(st("nodata")),
+            opaque: pct(frac(st("opaque"))), cirrus: pct(frac(st("cirrus"))), shadow: pct(frac(st("shadow"))),
+            noData: pct(Math.min(1, frac(st("nodata")) + missingFrac)),
           },
         });
       }
@@ -232,12 +242,14 @@ async function fetchDailyChunk(token: string, geometry: object, bbox: number[], 
 async function fetchDailyObservations(token: string, coords: LatLng[], from: string, to: string): Promise<DailyObservation[]> {
   const geometry = fieldGeometry(coords);
   const bbox = bboxOf(coords);
+  const size = gridSize(bbox, 10, 32, 256);
+  const grid = { ...size, fieldPixels: fieldPixelCount(coords, bbox, size.width, size.height) };
   const chunks: { from: string; to: string }[] = [];
   for (let f = from; f <= to; f = addDays(f, STATS_CHUNK_DAYS)) {
     const t = addDays(f, STATS_CHUNK_DAYS - 1);
     chunks.push({ from: f, to: t > to ? to : t });
   }
-  const parts = await Promise.all(chunks.map(c => fetchDailyChunk(token, geometry, bbox, c.from, c.to)));
+  const parts = await Promise.all(chunks.map(c => fetchDailyChunk(token, geometry, bbox, grid, c.from, c.to)));
   const byDate = new Map<string, DailyObservation>();
   for (const o of parts.flat()) if (o.date) byDate.set(o.date, o);
   return Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date));
