@@ -1011,16 +1011,73 @@ export function registerRoutes(httpServer: Server, app: Express) {
         return res.status(imgRes.status).json({ error: "Map rendering failed", detail: err.slice(0, 200) });
       }
 
-      const buf2 = await imgRes.arrayBuffer();
+      // Make every pixel outside the field boundary transparent, so the map shows only the field.
+      const rendered = decodePNG(Buffer.from(await imgRes.arrayBuffer()));
+      const clipped = clipPngToField(rendered, bbox, coords);
       res.set("Content-Type", "image/png");
       res.set("Cache-Control", "public, max-age=86400"); // cache 24h — same date always gives same image
-      res.send(Buffer.from(buf2));
+      res.send(clipped);
     } catch (err) {
       console.error("Map route error:", err);
       res.status(500).json({ error: "Map rendering failed", detail: String(err) });
     }
   });
 
+
+  // ─── Clip a rendered map to the field boundary (RGBA PNG, transparent outside) ──
+  function clipPngToField(
+    png: { width: number; height: number; channels: number; pixels: Buffer },
+    bbox: number[], coords: { lat: number; lng: number }[],
+  ): Buffer {
+    const { width, height, channels, pixels } = png;
+    const [minLng, minLat, maxLng, maxLat] = bbox;
+    const rgba = Buffer.alloc(width * height * 4);
+    for (let y = 0; y < height; y++) {
+      const lat = maxLat - ((y + 0.5) / height) * (maxLat - minLat);
+      for (let x = 0; x < width; x++) {
+        const lng = minLng + ((x + 0.5) / width) * (maxLng - minLng);
+        const src = (y * width + x) * channels, dst = (y * width + x) * 4;
+        const gray = channels < 3;
+        rgba[dst] = pixels[src];
+        rgba[dst + 1] = gray ? pixels[src] : pixels[src + 1];
+        rgba[dst + 2] = gray ? pixels[src] : pixels[src + 2];
+        rgba[dst + 3] = pointInPolygon(lat, lng, coords) ? 255 : 0;
+      }
+    }
+    return encodePNG(width, height, rgba);
+  }
+
+  // Minimal RGBA PNG encoder (filter 0, zlib deflate) — avoids an image dependency.
+  const CRC_TABLE = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+    return t;
+  })();
+  function crc32(buf: Buffer): number {
+    let c = 0xffffffff;
+    for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  }
+  function encodePNG(width: number, height: number, rgba: Buffer): Buffer {
+    const chunk = (type: string, data: Buffer) => {
+      const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+      const td = Buffer.concat([Buffer.from(type, "ascii"), data]);
+      const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(td));
+      return Buffer.concat([len, td, crc]);
+    };
+    const ihdr = Buffer.alloc(13);
+    ihdr.writeUInt32BE(width, 0); ihdr.writeUInt32BE(height, 4);
+    ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0; // 8-bit RGBA
+    const raw = Buffer.alloc(height * (width * 4 + 1));
+    for (let y = 0; y < height; y++) {
+      raw[y * (width * 4 + 1)] = 0;
+      rgba.copy(raw, y * (width * 4 + 1) + 1, y * width * 4, (y + 1) * width * 4);
+    }
+    return Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      chunk("IHDR", ihdr), chunk("IDAT", zlib.deflateSync(raw)), chunk("IEND", Buffer.alloc(0)),
+    ]);
+  }
 
   // ─── Minimal dependency-free PNG decoder (grayscale/RGB, 8-bit) ────────────
   // Decodes IHDR + IDAT chunks manually via zlib.inflateSync — avoids adding

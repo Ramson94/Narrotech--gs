@@ -325,13 +325,9 @@ export default function FieldAnalysis() {
         return;
       }
 
-      // Clamp to reasonable vertex count (keep every Nth point if > 50)
-      let finalPts = pts;
-      if (pts.length > 50) {
-        const step = Math.ceil(pts.length / 30);
-        finalPts = pts.filter((_, i) => i % step === 0);
-        toast({ title: `Large polygon simplified to ${finalPts.length} vertices` });
-      }
+      // Keep the uploaded boundary exactly as drawn — every vertex. The boundary is the only
+      // area the analysis uses, so it must never be simplified.
+      const finalPts = pts;
 
       setPolygon(finalPts);
       toast({ title: `${file.name} loaded — ${finalPts.length} vertices` });
