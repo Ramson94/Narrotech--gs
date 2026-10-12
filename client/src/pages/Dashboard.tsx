@@ -12,7 +12,7 @@ import { useToast } from "@/hooks/use-toast";
 import {
   SatelliteDish, AlertTriangle, Leaf, Droplets, TrendingUp,
   Plus, RefreshCw, Info, XCircle, Bell, CalendarRange, Trash2,
-  FileText, MessageCircle, Loader2, Sprout
+  FileText, MessageCircle, Loader2
 } from "lucide-react";
 import { RadialBarChart, RadialBar, ResponsiveContainer } from "recharts";
 
@@ -36,14 +36,6 @@ function getWaterLabel(ndwi: number | null) {
   return "Severe drought";
 }
 
-function getEviLabel(evi: number | null | undefined) {
-  if (evi === null || evi === undefined) return { label: "Unanalyzed", color: "bg-muted text-muted-foreground" };
-  if (evi >= 0.5) return { label: "Excellent", color: "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400" };
-  if (evi >= 0.35) return { label: "Good", color: "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-400" };
-  if (evi >= 0.2) return { label: "Moderate", color: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400" };
-  if (evi >= 0.1) return { label: "Poor", color: "bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-400" };
-  return { label: "Critical", color: "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400" };
-}
 
 function HealthGauge({ score }: { score: number | null }) {
   if (score === null) return (
@@ -324,18 +316,10 @@ export default function Dashboard() {
                       <p className={`text-xs ${isWaterPixel ? "text-blue-500" : "text-muted-foreground"}`}>
                         {waterLabel}
                       </p>
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs text-muted-foreground flex items-center gap-1">
-                          <Sprout size={11} /> EVI
-                        </span>
-                        <span className="text-xs font-mono font-medium">
-                          {field.evi !== null && field.evi !== undefined ? field.evi.toFixed(3) : "—"}
-                        </span>
-                      </div>
                       {validObs > 0 && (
                         <p className="text-xs text-muted-foreground flex items-center gap-1">
                           <CalendarRange size={10} />
-                          {validObs} valid obs · {field.dateFrom?.slice(0,7)} → {field.dateTo?.slice(0,7)}
+                          {validObs} images ≤20% cloud · {field.dateFrom?.slice(0,7)} → {field.dateTo?.slice(0,7)}
                         </p>
                       )}
                     </div>

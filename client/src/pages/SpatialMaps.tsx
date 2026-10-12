@@ -22,7 +22,7 @@ function NdviLegend() {
         { color: "#4caf3d", label: "Good (0.5–0.65)" },
         { color: "#1a6e00", label: "Excellent (>0.65)" },
         { color: "#1a4db3", label: "Water" },
-        { color: "#9aa0b0", label: "Cloud" },
+        { color: "#9aa0b0", label: "Cloud / shadow" },
       ].map(({ color, label }) => (
         <span key={label} className="flex items-center gap-1">
           <span className="inline-block w-3 h-3 rounded-sm flex-shrink-0" style={{ background: color }} />
@@ -44,29 +44,7 @@ function MsiLegend() {
         { color: "#f28700", label: "Moderate (1.0–1.2)" },
         { color: "#e51a00", label: "Severe (>1.2)" },
         { color: "#1a4db3", label: "Water" },
-        { color: "#9aa0b0", label: "Cloud" },
-      ].map(({ color, label }) => (
-        <span key={label} className="flex items-center gap-1">
-          <span className="inline-block w-3 h-3 rounded-sm flex-shrink-0" style={{ background: color }} />
-          {label}
-        </span>
-      ))}
-    </div>
-  );
-}
-
-function EviLegend() {
-  return (
-    <div className="flex items-center gap-2 flex-wrap text-xs text-muted-foreground mt-2">
-      <span className="font-medium text-foreground">EVI:</span>
-      {[
-        { color: "#9b1a8a", label: "Critical (<0.1)" },
-        { color: "#d1479e", label: "Poor (0.1–0.2)" },
-        { color: "#e8c400", label: "Moderate (0.2–0.35)" },
-        { color: "#7ec93d", label: "Good (0.35–0.5)" },
-        { color: "#1a8f3d", label: "Excellent (>0.5)" },
-        { color: "#1a4db3", label: "Water" },
-        { color: "#9aa0b0", label: "Cloud" },
+        { color: "#9aa0b0", label: "Cloud / shadow" },
       ].map(({ color, label }) => (
         <span key={label} className="flex items-center gap-1">
           <span className="inline-block w-3 h-3 rounded-sm flex-shrink-0" style={{ background: color }} />
@@ -192,7 +170,7 @@ async function downloadMapPng(
     ctx.fillRect(0, 0, SIZE, SIZE + HEADER + FOOTER);
 
     // Header text
-    const indexLabel = type === "ndvi" ? "NDVI — Vegetation Index" : type === "evi" ? "EVI — Enhanced Vegetation Index" : "MSI — Moisture Stress Index";
+    const indexLabel = type === "ndvi" ? "NDVI — Vegetation Index" : "MSI — Moisture Stress Index";
     ctx.fillStyle = "#f8fafc";
     ctx.font = "bold 14px system-ui, sans-serif";
     ctx.fillText(fieldName, 16, 20);
@@ -309,7 +287,7 @@ function MapTile({
 }: {
   fieldId: number;
   date: string;
-  type: "ndvi" | "msi" | "evi";
+  type: "ndvi" | "msi";
   label: string;
   coords: { lat: number; lng: number }[];
   fieldName: string;
@@ -409,7 +387,7 @@ function MapTile({
           />
         )}
 
-        {type === "ndvi" ? <NdviLegend /> : type === "evi" ? <EviLegend /> : <MsiLegend />}
+        {type === "ndvi" ? <NdviLegend /> : <MsiLegend />}
       </div>
 
       {/* Zoom modal — shows full unclipped image + clipped side by side */}
@@ -463,7 +441,7 @@ function MapTile({
               </div>
             </div>
             <div className="mt-3">
-              {type === "ndvi" ? <NdviLegend /> : type === "evi" ? <EviLegend /> : <MsiLegend />}
+              {type === "ndvi" ? <NdviLegend /> : <MsiLegend />}
             </div>
           </div>
         </div>
@@ -498,7 +476,7 @@ function StressZonesPanel({
   index: "ndvi" | "msi";
   indexLabel: string;
 }) {
-  const { data, isLoading, isError } = useQuery<{ zones: StressZone[]; fieldMean?: number; message?: string }>({
+  const { data, isLoading, isError, error } = useQuery<{ zones: StressZone[]; fieldMean?: number; message?: string }>({
     queryKey: [`/api/fields/${fieldId}/stress-zones`, date, index],
     queryFn: async () => {
       const res = await apiRequest("GET", `/api/fields/${fieldId}/stress-zones?date=${date}&index=${index}&maxZones=5`);
@@ -521,7 +499,7 @@ function StressZonesPanel({
   if (isError) {
     return (
       <p className="text-xs text-muted-foreground">
-        Couldn't compute stress zones for this date — try a different observation date.
+        Couldn't compute stress zones for this date. {error instanceof Error && error.message.includes("qualifying") ? "Re-run the field analysis to refresh its image dates." : "Try a different observation date."}
       </p>
     );
   }
@@ -592,10 +570,11 @@ function StressZonesPanel({
 
 // ── Date window row (one observation date) ──────────────────────────────────
 function DateRow({
-  fieldId, date, coords, fieldName
+  fieldId, date, cloudCover, coords, fieldName
 }: {
   fieldId: number;
   date: string;
+  cloudCover?: number | null;
   coords: { lat: number; lng: number }[];
   fieldName: string;
 }) {
@@ -604,12 +583,11 @@ function DateRow({
       <div className="flex items-center gap-2">
         <Calendar size={14} className="text-muted-foreground" />
         <span className="text-sm font-semibold text-foreground">{date}</span>
-        <Badge variant="outline" className="text-xs">Bi-weekly observation</Badge>
+        <Badge variant="outline" className="text-xs">{typeof cloudCover === "number" ? `${cloudCover}% field cloud` : "Sentinel-2 L2A"}</Badge>
       </div>
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
         <MapTile fieldId={fieldId} date={date} type="ndvi" label="NDVI — Vegetation Index" coords={coords} fieldName={fieldName} />
         <MapTile fieldId={fieldId} date={date} type="msi"  label="MSI — Moisture Stress"   coords={coords} fieldName={fieldName} />
-        <MapTile fieldId={fieldId} date={date} type="evi"  label="EVI — Enhanced Vegetation" coords={coords} fieldName={fieldName} />
       </div>
       <div className="pt-3 border-t border-border space-y-4">
         <StressZonesPanel fieldId={fieldId} date={date} index="ndvi" indexLabel="NDVI" />
@@ -632,16 +610,14 @@ export default function SpatialMaps() {
 
   const selectedField = analyzedFields.find(f => String(f.id) === selectedFieldId);
 
-  // Extract unique observation dates from time series
-  const obsDates: string[] = selectedField?.timeSeriesData
-    ? [
-        ...new Set(
-          (JSON.parse(selectedField.timeSeriesData) as any[])
-            .filter(d => !d.excluded && d.ndvi !== null)
-            .map((d: any) => d.date as string)
-        ),
-      ].sort()
+  // Only images that passed the ≤20% field-cloud rule (the dates in the time series)
+  const observations: { date: string; cloudCover: number | null }[] = selectedField?.timeSeriesData
+    ? (JSON.parse(selectedField.timeSeriesData) as any[])
+        .filter(d => !d.excluded && d.ndvi !== null)
+        .map(d => ({ date: d.date as string, cloudCover: typeof d.cloudCover === "number" ? d.cloudCover : null }))
+        .sort((a, b) => a.date.localeCompare(b.date))
     : [];
+  const obsDates = observations.map(o => o.date);
 
   return (
     <div className="space-y-6 max-w-5xl mx-auto">
@@ -653,7 +629,7 @@ export default function SpatialMaps() {
             Spatial Maps
           </h2>
           <p className="text-sm text-muted-foreground mt-0.5">
-            Bi-weekly NDVI, MSI and EVI maps from Sentinel-2 — see spatial variation across your field.
+            NDVI and MSI maps from the Sentinel-2 images used in the time series (20% or less cloud over the field).
             Download or share any map as a PNG image.
           </p>
         </div>
@@ -705,16 +681,17 @@ export default function SpatialMaps() {
             <Info size={13} className="text-muted-foreground" />
             <p className="text-xs text-muted-foreground">
               Each map shows a 256×256 pixel false-colour rendering over your field boundary.
-              Images are cloud-filtered (best overpass within ±3 days of each date).
-              <strong className="text-foreground"> Grey = cloud, Blue = water.</strong>
+              Each map uses exactly the image listed in the time series for that date (20% or less cloud over the field).
+              <strong className="text-foreground"> Grey = cloud or cloud shadow, Blue = water.</strong>
               {" "}Use the <strong className="text-foreground">PNG</strong> or <strong className="text-foreground">Share</strong> buttons on each map to export or send directly.
             </p>
           </div>
-          {obsDates.map(date => (
+          {observations.map(({ date, cloudCover }) => (
             <DateRow
               key={date}
               fieldId={selectedField.id}
               date={date}
+              cloudCover={cloudCover}
               coords={JSON.parse(selectedField.coordinates)}
               fieldName={selectedField.name}
             />

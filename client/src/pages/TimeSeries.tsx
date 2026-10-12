@@ -39,14 +39,14 @@ const CustomTooltip = ({ active, payload, label }: any) => {
           </div>
         )
       ))}
-      {payload[0]?.payload?.cloudCover !== undefined && (
+      {typeof payload[0]?.payload?.cloudCover === "number" && (
         <div className="flex items-center gap-1.5 mt-2 pt-2 border-t border-border text-muted-foreground">
           <Cloud size={10} />
-          <span>Cloud cover: {payload[0].payload.cloudCover}%</span>
+          <span>Field cloud cover: {payload[0].payload.cloudCover}%</span>
         </div>
       )}
       {payload[0]?.payload?.excluded && (
-        <p className="text-orange-500 mt-1 flex items-center gap-1"><AlertTriangle size={10} /> Cloudy — excluded</p>
+        <p className="text-orange-500 mt-1 flex items-center gap-1"><AlertTriangle size={10} /> No image ≤20% cloud in this window</p>
       )}
       {payload[0]?.payload?.isWater && (
         <p className="text-blue-500 mt-1 flex items-center gap-1"><Droplets size={10} /> Open water pixel</p>
@@ -82,20 +82,21 @@ function getDefaultDates() {
 // ── Download helpers ──────────────────────────────────────────────────────────
 
 function downloadCSV(data: any[], fieldName: string, dateFrom: string, dateTo: string) {
-  const headers = ["Date", "NDVI", "MSI", "EVI", "Soil Moisture (OPTRAM)", "Cloud Cover (%)", "Status", "Data Source"];
+  const headers = ["Image Date", "14-day Window", "NDVI", "MSI", "Soil Moisture (OPTRAM)", "Field Cloud Cover (%)", "Status", "Data Source"];
   const rows = [...data].reverse().map(d => [
-    d.date,
+    d.excluded ? "" : d.date,
+    d.windowFrom ? `${d.windowFrom} to ${d.windowTo}` : "",
     d.NDVI !== null && d.NDVI !== undefined ? d.NDVI.toFixed(3) : "",
     d.MSI !== null && d.MSI !== undefined ? d.MSI.toFixed(3) : "",
-    d.EVI !== null && d.EVI !== undefined ? d.EVI.toFixed(3) : "",
     d["Soil Moisture (OPTRAM)"] !== null && d["Soil Moisture (OPTRAM)"] !== undefined ? d["Soil Moisture (OPTRAM)"].toFixed(3) : "",
-    d.cloudCover ?? "",
-    d.excluded ? "Cloudy-excluded" : d.isWater ? "Open water-removed" : "Valid",
+    typeof d.cloudCover === "number" ? d.cloudCover : "",
+    d.excluded ? "No image <=20% cloud" : d.isWater ? "Mostly open water - removed" : "Valid",
     d.dataSource ?? "",
   ]);
 
   const metaLines = [
-    `# NarrowTech GS — NDVI, MSI & EVI Time Series`,
+    `# NarrowTech GS — NDVI & MSI Time Series`,
+    `# Only Sentinel-2 L2A images with 20% or less cloud over the field are used`,
     `# Field: ${fieldName}`,
     `# Period: ${dateFrom} to ${dateTo}`,
     `# Generated: ${new Date().toISOString()}`,
@@ -228,7 +229,6 @@ export default function TimeSeries() {
   const [selectedFieldId, setSelectedFieldId] = useState<string>("");
   const [dateFrom, setDateFrom] = useState(defaults.from);
   const [dateTo, setDateTo] = useState(defaults.to);
-  const [cloudCoverMax, setCloudCoverMax] = useState<number>(20);
   const [chartData, setChartData] = useState<any[]>([]);
 
   const { data: fields = [], isLoading: fieldsLoading } = useQuery<Field[]>({
@@ -244,7 +244,7 @@ export default function TimeSeries() {
   const analyzeMutation = useMutation({
     mutationFn: async () => {
       if (!selectedFieldId) throw new Error("No field selected");
-      return runAnalyzeJob(Number(selectedFieldId), { dateFrom, dateTo, cloudCoverMax });
+      return runAnalyzeJob(Number(selectedFieldId), { dateFrom, dateTo });
     },
     onSuccess: (data) => {
       const ts = data.timeSeriesData || [];
@@ -253,13 +253,16 @@ export default function TimeSeries() {
       queryClient.invalidateQueries({ queryKey: ["/api/alerts"] });
       const validCount = ts.filter((d: any) => !d.excluded && !d.isWater).length;
       const excludedCount = ts.filter((d: any) => d.excluded).length;
-      const waterCount = ts.filter((d: any) => d.isWater).length;
       toast({
         title: "Time series ready",
-        description: `${validCount} valid observations · ${excludedCount} cloudy excluded · ${waterCount} water pixels removed`,
+        description: `${validCount} images with ≤20% field cloud · ${excludedCount} windows without a qualifying image`,
       });
     },
-    onError: () => toast({ title: "Analysis failed", variant: "destructive" }),
+    onError: (err: unknown) => toast({
+      title: "Analysis failed",
+      description: err instanceof Error ? err.message : String(err),
+      variant: "destructive",
+    }),
   });
 
   // Load existing time series when field changes
@@ -270,7 +273,6 @@ export default function TimeSeries() {
       setChartData(JSON.parse(field.timeSeriesData));
       if (field.dateFrom) setDateFrom(field.dateFrom);
       if (field.dateTo) setDateTo(field.dateTo);
-      if (field.cloudCoverMax) setCloudCoverMax(field.cloudCoverMax);
     } else {
       setChartData([]);
     }
@@ -286,9 +288,10 @@ export default function TimeSeries() {
     date: d.date,
     NDVI: d.excluded || d.isWater ? null : d.ndvi,
     MSI: d.excluded || d.isWater ? null : d.ndwi,
-    EVI: d.excluded || d.isWater ? null : (d.evi ?? null),
     "Soil Moisture (OPTRAM)": d.excluded || d.isWater ? null : (d.soilMoisture ?? null),
     cloudCover: d.cloudCover,
+    windowFrom: d.windowFrom,
+    windowTo: d.windowTo,
     excluded: d.excluded,
     isWater: d.isWater,
     dataSource: d.dataSource,
@@ -316,10 +319,10 @@ export default function TimeSeries() {
   return (
     <div className="max-w-6xl space-y-5">
       <div>
-        <h2 className="text-xl font-bold text-foreground">NDVI, MSI & EVI Time Series</h2>
+        <h2 className="text-xl font-bold text-foreground">NDVI & MSI Time Series</h2>
         <p className="text-sm text-muted-foreground mt-0.5">
-          Plot vegetation health and water stress over time using Sentinel-2 bi-weekly passes.
-          Open water pixels are automatically excluded from stress analysis.
+          Vegetation health and water stress over time from Sentinel-2 Level-2A images with 20% or less cloud over the field.
+          Cloud, cloud-shadow and water pixels are removed before averaging.
         </p>
       </div>
 
@@ -332,9 +335,9 @@ export default function TimeSeries() {
         }`}>
           <SatelliteDish size={13} />
           <span className="font-medium">{sentinelStatus.mode}</span>
-          {sentinelStatus.connected && <span className="text-muted-foreground">· Token: {sentinelStatus.tokenHint}</span>}
+          {sentinelStatus.connected && <span className="text-muted-foreground">· Connected</span>}
           {!sentinelStatus.connected && (
-            <span className="text-muted-foreground">· Share your SentinelHub API token to enable real satellite data</span>
+            <span className="text-muted-foreground">· Not connected — check the Copernicus credentials</span>
           )}
         </div>
       )}
@@ -347,12 +350,12 @@ export default function TimeSeries() {
             Analysis Configuration
           </CardTitle>
           <CardDescription className="text-xs">
-            Select a field and time range. Data is sourced every ~14 days (bi-weekly Sentinel-2 pass).
-            Cloud cover &gt; {cloudCoverMax}% observations are automatically excluded.
+            Select a field and time range. One image is used per 14-day window: the clearest with 20% or less
+            cloud over the field. If a window has none, the nearest such image up to 7 days away is used.
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-4">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
             {/* Field selector */}
             <div className="space-y-1.5">
               <Label className="text-xs">Field</Label>
@@ -396,22 +399,6 @@ export default function TimeSeries() {
               />
             </div>
 
-            {/* Cloud Cover */}
-            <div className="space-y-1.5">
-              <Label className="text-xs">Max Cloud Cover (%)</Label>
-              <Select value={String(cloudCoverMax)} onValueChange={v => setCloudCoverMax(Number(v))}>
-                <SelectTrigger data-testid="select-cloud-cover">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="5">5% — Very strict</SelectItem>
-                  <SelectItem value="10">10% — Strict</SelectItem>
-                  <SelectItem value="20">20% — Recommended</SelectItem>
-                  <SelectItem value="30">30% — Relaxed</SelectItem>
-                  <SelectItem value="50">50% — Permissive</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
           </div>
 
           {/* Quick date range presets */}
@@ -457,9 +444,9 @@ export default function TimeSeries() {
       {validObs.length > 0 && (
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           {[
-            { label: "Valid Observations", value: validObs.length, icon: CheckCircle2, color: "text-green-600 dark:text-green-400" },
-            { label: "Cloudy / Excluded", value: cloudyObs.length, icon: Cloud, color: "text-orange-500" },
-            { label: "Water Pixels Removed", value: waterObs.length, icon: Droplets, color: "text-blue-500" },
+            { label: "Images ≤20% Cloud", value: validObs.length, icon: CheckCircle2, color: "text-green-600 dark:text-green-400" },
+            { label: "Windows Without Image", value: cloudyObs.length, icon: Cloud, color: "text-orange-500" },
+            { label: "Mostly-Water Dates", value: waterObs.length, icon: Droplets, color: "text-blue-500" },
             { label: "Latest NDVI", value: latestNdvi?.toFixed(3) ?? "—", icon: Leaf, color: "text-emerald-600 dark:text-emerald-400" },
           ].map(({ label, value, icon: Icon, color }) => (
             <Card key={label}>
@@ -481,20 +468,19 @@ export default function TimeSeries() {
           <div className="flex items-start justify-between gap-4 flex-wrap">
             <div>
               <CardTitle className="text-base">
-                NDVI, MSI & EVI Time Series
+                NDVI & MSI Time Series
                 {selectedField && <span className="text-muted-foreground font-normal ml-2">— {selectedField.name}</span>}
               </CardTitle>
               <CardDescription className="text-xs mt-1">
-                {dateFrom} → {dateTo} · Bi-weekly Sentinel-2 observations · Cloud cover ≤ {cloudCoverMax}%
+                {dateFrom} → {dateTo} · Sentinel-2 L2A · Field cloud cover ≤ 20%
               </CardDescription>
             </div>
             <div className="flex items-center gap-3 flex-wrap">
               <div className="flex items-center gap-3 text-xs">
                 <span className="flex items-center gap-1.5"><span className="w-3 h-1 rounded bg-emerald-500 inline-block" />NDVI</span>
                 <span className="flex items-center gap-1.5"><span className="w-3 h-1 rounded bg-blue-500 inline-block" />MSI</span>
-                <span className="flex items-center gap-1.5"><span className="w-3 h-1 rounded bg-purple-500 inline-block" />EVI</span>
                 <span className="flex items-center gap-1.5"><span className="w-3 h-1 rounded bg-teal-500 inline-block" />Soil Moisture (OPTRAM)</span>
-                <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-orange-400 inline-block" />Cloudy</span>
+                <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-orange-400 inline-block" />No image</span>
                 <span className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-blue-400 inline-block" />Water</span>
               </div>
               {/* Export button — only show when there's data */}
@@ -583,19 +569,6 @@ export default function TimeSeries() {
                     strokeDasharray="none"
                   />
 
-                  {/* EVI line — purple */}
-                  <Line
-                    type="monotone"
-                    dataKey="EVI"
-                    stroke="#a855f7"
-                    strokeWidth={2.5}
-                    dot={{ fill: "#a855f7", r: 3, strokeWidth: 0 }}
-                    activeDot={{ r: 5, fill: "#a855f7" }}
-                    connectNulls={false}
-                    name="EVI"
-                    strokeDasharray="5 2"
-                  />
-
                   {/* Soil Moisture (OPTRAM) line — teal */}
                   <Line
                     type="monotone"
@@ -623,7 +596,7 @@ export default function TimeSeries() {
               <div>
                 <CardTitle className="text-sm">Observation Log</CardTitle>
                 <CardDescription className="text-xs">
-                  All Sentinel-2 passes in the selected period. Open water pixels and cloudy scenes (&gt;{cloudCoverMax}% cloud) are excluded.
+                  One row per 14-day window. Cloud % is measured over the field only; images above 20% are never used.
                 </CardDescription>
               </div>
               {/* Download CSV + PNG chart buttons */}
@@ -646,43 +619,43 @@ export default function TimeSeries() {
               <table className="w-full text-xs">
                 <thead>
                   <tr className="border-b border-border">
-                    <th className="text-left py-2 pr-4 text-muted-foreground font-medium">Date</th>
+                    <th className="text-left py-2 pr-4 text-muted-foreground font-medium">Image Date</th>
+                    <th className="text-left py-2 pr-4 text-muted-foreground font-medium">14-day Window</th>
                     <th className="text-right py-2 pr-4 text-muted-foreground font-medium">NDVI</th>
                     <th className="text-right py-2 pr-4 text-muted-foreground font-medium">MSI</th>
-                    <th className="text-right py-2 pr-4 text-muted-foreground font-medium">EVI</th>
                     <th className="text-right py-2 pr-4 text-muted-foreground font-medium">Soil Moisture</th>
-                    <th className="text-right py-2 pr-4 text-muted-foreground font-medium">Cloud %</th>
+                    <th className="text-right py-2 pr-4 text-muted-foreground font-medium">Field Cloud %</th>
                     <th className="text-left py-2 text-muted-foreground font-medium">Status</th>
                   </tr>
                 </thead>
                 <tbody>
                   {[...plotData].reverse().map((d, i) => (
                     <tr key={i} className={`border-b border-border/50 ${d.excluded || d.isWater ? "opacity-50" : ""}`}>
-                      <td className="py-1.5 pr-4 font-mono">{d.date}</td>
+                      <td className="py-1.5 pr-4 font-mono">{d.excluded ? "—" : d.date}</td>
+                      <td className="py-1.5 pr-4 font-mono text-muted-foreground">{d.windowFrom ? `${d.windowFrom.slice(5)} → ${d.windowTo?.slice(5)}` : "—"}</td>
                       <td className="py-1.5 pr-4 text-right font-mono text-emerald-600 dark:text-emerald-400">
                         {d.NDVI !== null && d.NDVI !== undefined ? d.NDVI.toFixed(3) : "—"}
                       </td>
                       <td className="py-1.5 pr-4 text-right font-mono text-blue-600 dark:text-blue-400">
                         {d.MSI !== null && d.MSI !== undefined ? d.MSI.toFixed(3) : "—"}
                       </td>
-                      <td className="py-1.5 pr-4 text-right font-mono text-purple-600 dark:text-purple-400">
-                        {d.EVI !== null && d.EVI !== undefined ? d.EVI.toFixed(3) : "—"}
-                      </td>
                       <td className="py-1.5 pr-4 text-right font-mono text-teal-600 dark:text-teal-400">
                         {d["Soil Moisture (OPTRAM)"] !== null && d["Soil Moisture (OPTRAM)"] !== undefined ? d["Soil Moisture (OPTRAM)"].toFixed(3) : "—"}
                       </td>
                       <td className="py-1.5 pr-4 text-right">
-                        <span className={d.cloudCover > cloudCoverMax ? "text-orange-500 font-semibold" : "text-muted-foreground"}>
-                          {d.cloudCover ?? "—"}%
+                        <span className="text-muted-foreground">
+                          {typeof d.cloudCover === "number" ? `${d.cloudCover}%` : "—"}
                         </span>
                       </td>
                       <td className="py-1.5">
                         {d.excluded ? (
-                          <span className="flex items-center gap-1 text-orange-500"><Cloud size={10} /> Cloudy — excluded</span>
+                          <span className="flex items-center gap-1 text-orange-500"><Cloud size={10} /> No image ≤20% cloud</span>
                         ) : d.isWater ? (
-                          <span className="flex items-center gap-1 text-blue-500"><Droplets size={10} /> Open water — removed</span>
+                          <span className="flex items-center gap-1 text-blue-500"><Droplets size={10} /> Mostly open water — removed</span>
                         ) : (
-                          <span className="flex items-center gap-1 text-emerald-600 dark:text-emerald-400"><CheckCircle2 size={10} /> Valid</span>
+                          <span className="flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
+                            <CheckCircle2 size={10} /> {d.dataSource?.includes("outside window") ? "Valid — nearest image" : "Valid"}
+                          </span>
                         )}
                       </td>
                     </tr>
@@ -695,7 +668,7 @@ export default function TimeSeries() {
       )}
 
       {/* Legend cards */}
-      <div className="grid sm:grid-cols-3 gap-4">
+      <div className="grid sm:grid-cols-2 gap-4">
         <Card className="bg-emerald-50 dark:bg-emerald-950/20 border-emerald-200 dark:border-emerald-900/40">
           <CardContent className="p-4 space-y-2">
             <p className="text-xs font-semibold text-emerald-700 dark:text-emerald-400 flex items-center gap-1.5">
@@ -727,25 +700,6 @@ export default function TimeSeries() {
               ["0.6–1.0", "Mild water stress", "text-yellow-600 dark:text-yellow-400"],
               ["1.0–1.2", "Moderate drought", "text-orange-600 dark:text-orange-400"],
               ["> 1.2", "Severe drought stress", "text-red-600 dark:text-red-400"],
-            ].map(([range, label, cls]) => (
-              <div key={range} className="flex justify-between text-xs">
-                <span className={`font-mono font-medium ${cls}`}>{range}</span>
-                <span className="text-muted-foreground">{label}</span>
-              </div>
-            ))}
-          </CardContent>
-        </Card>
-        <Card className="bg-purple-50 dark:bg-purple-950/20 border-purple-200 dark:border-purple-900/40">
-          <CardContent className="p-4 space-y-2">
-            <p className="text-xs font-semibold text-purple-700 dark:text-purple-400 flex items-center gap-1.5">
-              <Leaf size={12} /> EVI Reference Ranges
-            </p>
-            {[
-              ["≥ 0.5", "Dense healthy canopy", "text-green-700 dark:text-green-400"],
-              ["0.35–0.5", "Good vegetation vigor", "text-emerald-600 dark:text-emerald-400"],
-              ["0.2–0.35", "Moderate / developing", "text-yellow-600 dark:text-yellow-400"],
-              ["0.1–0.2", "Poor / sparse canopy", "text-orange-600 dark:text-orange-400"],
-              ["< 0.1", "Critical / bare soil", "text-red-600 dark:text-red-400"],
             ].map(([range, label, cls]) => (
               <div key={range} className="flex justify-between text-xs">
                 <span className={`font-mono font-medium ${cls}`}>{range}</span>

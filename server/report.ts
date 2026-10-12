@@ -44,15 +44,6 @@ function msiLabel(v: number | null): { text: string; color: string } {
   return { text: "Severe drought", color: C.red };
 }
 
-function eviLabel(v: number | null | undefined): { text: string; color: string } {
-  if (v === null || v === undefined) return { text: "Not analyzed", color: C.muted };
-  if (v >= 0.5) return { text: "Excellent", color: C.green };
-  if (v >= 0.35) return { text: "Good", color: C.green };
-  if (v >= 0.2) return { text: "Moderate", color: C.yellow };
-  if (v >= 0.1) return { text: "Poor", color: C.orange };
-  return { text: "Critical", color: C.red };
-}
-
 function healthColor(score: number | null): string {
   if (score === null) return C.muted;
   if (score >= 70) return C.green;
@@ -91,7 +82,7 @@ function drawBar(
 // ── Mini sparkline (time series) ─────────────────────────────────────────────
 function drawSparkline(
   doc: typeof PDFDocument.prototype,
-  data: { date: string; ndvi: number | null; ndwi: number | null; evi?: number | null }[],
+  data: { date: string; ndvi: number | null; ndwi: number | null }[],
   x: number, y: number, w: number, h: number
 ) {
   const valid = data.filter(d => d.ndvi !== null && !isNaN(d.ndvi as number));
@@ -147,21 +138,6 @@ function drawSparkline(
     doc.moveTo(msiPts[0].px, msiPts[0].py);
     msiPts.slice(1).forEach(p => doc.lineTo(p.px, p.py));
     doc.strokeColor(C.blue).lineWidth(1).stroke();
-  }
-
-  // EVI line (purple)
-  const eviPts = valid
-    .map((d: any, i) => ({
-      px: cx + (i / (valid.length - 1)) * cw,
-      py: d.evi !== null && d.evi !== undefined ? cy + ch - Math.min(1, Math.max(0, (d.evi as number))) * ch : null,
-    }))
-    .filter(p => p.py !== null) as { px: number; py: number }[];
-
-  if (eviPts.length >= 2) {
-    doc.moveTo(eviPts[0].px, eviPts[0].py);
-    eviPts.slice(1).forEach(p => doc.lineTo(p.px, p.py));
-    doc.strokeColor(C.purple).lineWidth(1).dash(2, { space: 1.5 }).stroke();
-    doc.undash();
   }
 
   // X axis labels — first and last date
@@ -232,7 +208,7 @@ export function generateFieldReport(
   curY += 14;
 
   // ── KPI cards row ────────────────────────────────────────────────────────
-  const kpiW = (CONTENT_W - 15) / 4;
+  const kpiW = (CONTENT_W - 10) / 3;
   const kpiH = 70;
   const kpis = [
     {
@@ -248,13 +224,6 @@ export function generateFieldReport(
       sublabel: msiLabel(field.ndwi ?? null).text,
       color: msiLabel(field.ndwi ?? null).color,
       note: "Moisture Stress Index",
-    },
-    {
-      label: "EVI",
-      value: field.evi !== null && field.evi !== undefined ? field.evi.toFixed(3) : "—",
-      sublabel: eviLabel(field.evi ?? null).text,
-      color: eviLabel(field.evi ?? null).color,
-      note: "Enhanced Vegetation Index",
     },
     {
       label: "Health Score",
@@ -335,32 +304,15 @@ export function generateFieldReport(
   }
   curY += 30;
 
-  // ── EVI reference bar ──────────────────────────────────────────────────
-  doc.fontSize(9).fillColor(C.dark).font("Helvetica-Bold")
-    .text("EVI — Enhanced Vegetation Index", MARGIN, curY);
-  curY += 14;
-
-  if (field.evi !== null && field.evi !== undefined) {
-    drawBar(doc, MARGIN, curY, CONTENT_W, 12, field.evi, 1.0, eviLabel(field.evi).color);
-    doc.fontSize(7.5).fillColor(C.muted).font("Helvetica")
-      .text("0", MARGIN, curY + 14)
-      .text("0.2 (moderate)", MARGIN + CONTENT_W * 0.2 - 20, curY + 14)
-      .text("0.35 (good)", MARGIN + CONTENT_W * 0.35 - 16, curY + 14)
-      .text("0.5+ (excellent)", MARGIN + CONTENT_W * 0.5 - 10, curY + 14);
-  } else {
-    doc.fontSize(8).fillColor(C.muted).text("No data", MARGIN, curY);
-  }
-  curY += 30;
-
   // ── Time series chart ─────────────────────────────────────────────────────
   if (field.timeSeriesData) {
     const ts: any[] = JSON.parse(field.timeSeriesData);
     const validObs = ts.filter(d => !d.excluded && !d.isWater && d.ndvi !== null);
 
     doc.fontSize(9).fillColor(C.dark).font("Helvetica-Bold")
-      .text("Time Series — NDVI, MSI & EVI", MARGIN, curY);
+      .text("Time Series — NDVI & MSI", MARGIN, curY);
     doc.fontSize(7.5).fillColor(C.muted).font("Helvetica")
-      .text(`${validObs.length} valid Sentinel-2 observations  ·  ${ts.filter(d => d.excluded).length} cloudy excluded  ·  ${ts.filter(d => d.isWater).length} water pixels removed`,
+      .text(`${validObs.length} Sentinel-2 images with 20% or less cloud over the field  ·  ${ts.filter(d => d.excluded).length} windows with no qualifying image`,
         MARGIN, curY + 12);
     curY += 26;
 
@@ -373,8 +325,6 @@ export function generateFieldReport(
     doc.fontSize(7).fillColor(C.muted).font("Helvetica").text("NDVI (vegetation)", MARGIN + 8, legY);
     doc.circle(MARGIN + 113, legY + 4, 3).fillColor(C.blue).fill();
     doc.text("MSI (moisture stress, /2 scaled)", MARGIN + 118, legY);
-    doc.circle(MARGIN + 268, legY + 4, 3).fillColor(C.purple).fill();
-    doc.text("EVI (enhanced vegetation)", MARGIN + 273, legY);
     curY = legY + 18;
   }
 
@@ -428,7 +378,7 @@ export function generateFieldReport(
         { label: "Date",    x: MARGIN,       w: 65 },
         { label: "NDVI",   x: MARGIN + 68,   w: 55 },
         { label: "MSI",    x: MARGIN + 126,  w: 55 },
-        { label: "EVI",    x: MARGIN + 184,  w: 55 },
+        { label: "Cloud %", x: MARGIN + 184, w: 55 },
         { label: "Status", x: MARGIN + 242,  w: 130 },
         { label: "Source", x: MARGIN + 375,  w: 75 },
       ];
@@ -447,7 +397,7 @@ export function generateFieldReport(
         doc.text(row.date ?? "—", cols[0].x + 4, curY + 3, { width: cols[0].w });
         doc.fillColor(C.green).text((row.ndvi ?? 0).toFixed(3), cols[1].x + 4, curY + 3, { width: cols[1].w });
         doc.fillColor(C.blue).text((row.ndwi ?? 0).toFixed(3), cols[2].x + 4, curY + 3, { width: cols[2].w });
-        doc.fillColor(C.purple).text(row.evi !== null && row.evi !== undefined ? row.evi.toFixed(3) : "—", cols[3].x + 4, curY + 3, { width: cols[3].w });
+        doc.fillColor(C.mid).text(typeof row.cloudCover === "number" ? `${row.cloudCover}%` : "—", cols[3].x + 4, curY + 3, { width: cols[3].w });
         doc.fillColor(C.mid).text(ndviLabel(row.ndvi).text, cols[4].x + 4, curY + 3, { width: cols[4].w });
         doc.fillColor(C.muted).text(row.dataSource ?? "Sentinel-2", cols[5].x + 4, curY + 3, { width: cols[5].w });
         curY += 14;
@@ -470,9 +420,8 @@ export function generateFieldReport(
     "Satellite: ESA Sentinel-2 Level-2A (10m resolution) via Copernicus Data Space",
     "NDVI = (B08 − B04) / (B08 + B04) · Range −1 to 1; healthy vegetation typically 0.4–0.8",
     "MSI = B11 / B8A (SWIR/NIR) · Increases with water stress; open water pixels (MSI < 0.1) excluded",
-    "EVI = 2.5 × (B08 − B04) / (B08 + 6×B04 − 7.5×B02 + 1) · Enhanced Vegetation Index; reduces soil/atmospheric background noise vs NDVI",
-    "Observation cadence: bi-weekly (best cloud-free pass within each 14-day window)",
-    `Cloud filter: scenes with > ${field.cloudCoverMax ?? 20}% cloud cover excluded; fallback to least-cloudy available`,
+    "Observation cadence: one image per 14-day window (the clearest image with 20% or less cloud over the field; if none, the nearest such image up to 7 days outside the window)",
+    "Cloud filter: measured over the field itself; cloud, cirrus and cloud shadow count as cloud and are masked from all averages and maps",
     "Health Score (0–100): NDVI score × 0.7 + MSI score × 0.3 · 70+ Healthy, 45-69 Monitor, below 45 Alert",
   ];
 

@@ -11,16 +11,14 @@ export const fields = sqliteTable("fields", {
   coordinates: text("coordinates").notNull(),
   ndvi: real("ndvi"),
   ndwi: real("ndwi"),
-  evi: real("evi"),
   healthScore: integer("health_score"),
   status: text("status").default("pending"), // pending, analyzed, alert
-  // JSON array of FieldTimeSeriesPoint (see type below):
-  // {date, ndvi, ndwi, evi, soilMoisture, cloudCover, isWater, dataSource}
+  // JSON array of FieldTimeSeriesPoint (see type below)
   timeSeriesData: text("time_series_data"),
   // Date range used for last analysis
   dateFrom: text("date_from"),
   dateTo: text("date_to"),
-  cloudCoverMax: integer("cloud_cover_max").default(20),
+  cloudCoverMax: integer("cloud_cover_max").default(20), // fixed at 20 (% cloud over the field)
   analyzedAt: text("analyzed_at"),
   notes: text("notes").default(""),
   // Notification tracking
@@ -32,19 +30,23 @@ export const insertFieldSchema = createInsertSchema(fields).omit({ id: true });
 export type InsertField = z.infer<typeof insertFieldSchema>;
 export type Field = typeof fields.$inferSelect;
 
-// One per-date observation in a field's `timeSeriesData` JSON array.
+// One entry per 14-day window in a field's `timeSeriesData` JSON array.
+// `date` is the acquisition date of the image used (or the window's middle for a gap).
 // `ndwi` holds the Moisture Stress Index (MSI); `soilMoisture` is the OPTRAM wetness index W
-// (relative soil moisture, ~0 dry .. 1 wet) or null when unavailable/filtered out for a date.
+// (relative soil moisture, ~0 dry .. 1 wet) or null when unavailable for a date.
+// `cloudCover` is the % of the FIELD (not the satellite tile) covered by cloud, cirrus, cloud
+// shadow or missing data; only images with cloudCover <= 20 are used. Gaps have excluded = true.
 export type FieldTimeSeriesPoint = {
   date: string;
   ndvi: number | null;
   ndwi: number | null;
-  evi: number | null;
   soilMoisture: number | null;
-  cloudCover: number;
+  cloudCover: number | null;
   isWater: boolean;
   dataSource: string;
   excluded?: boolean;
+  windowFrom?: string;
+  windowTo?: string;
 };
 
 export const alerts = sqliteTable("alerts", {

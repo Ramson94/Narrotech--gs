@@ -124,7 +124,6 @@ export default function FieldAnalysis() {
   const [notes, setNotes] = useState("");
   const [dateFrom, setDateFrom] = useState(defaults.from);
   const [dateTo, setDateTo] = useState(defaults.to);
-  const [cloudCoverMax, setCloudCoverMax] = useState("20");
 
   // Shared polygon state — array of LatLng (the "truth")
   const [polygon, setPolygon] = useState<LatLng[]>([]);
@@ -381,11 +380,8 @@ export default function FieldAnalysis() {
         name: fieldName, region, cropType,
         coordinates: JSON.stringify(polygon),
         notes, dateFrom, dateTo,
-        cloudCoverMax: Number(cloudCoverMax),
       }).then(r => r.json());
-      await runAnalyzeJob(field.id, {
-        dateFrom, dateTo, cloudCoverMax: Number(cloudCoverMax),
-      });
+      await runAnalyzeJob(field.id, { dateFrom, dateTo });
       return field;
     },
     onSuccess: () => {
@@ -514,19 +510,10 @@ export default function FieldAnalysis() {
                     value={dateTo} onChange={e => setDateTo(e.target.value)} className="text-sm" />
                 </div>
               </div>
-              <div className="space-y-1.5">
-                <Label className="text-xs flex items-center gap-1.5"><Cloud size={11} /> Max Cloud Cover</Label>
-                <Select value={cloudCoverMax} onValueChange={setCloudCoverMax}>
-                  <SelectTrigger data-testid="select-cloud-cover"><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="5">5% — Very strict</SelectItem>
-                    <SelectItem value="10">10% — Strict</SelectItem>
-                    <SelectItem value="20">20% — Recommended ✓</SelectItem>
-                    <SelectItem value="30">30% — Relaxed</SelectItem>
-                    <SelectItem value="50">50% — Permissive</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
+              <p className="text-xs text-muted-foreground flex items-start gap-1.5">
+                <Cloud size={11} className="mt-0.5 flex-shrink-0" />
+                Only Sentinel-2 images with 20% or less cloud over this field are used.
+              </p>
             </CardContent>
           </Card>
 
@@ -748,8 +735,9 @@ export default function FieldAnalysis() {
                 {[
                   "NDVI from Sentinel-2 Red (B04) + NIR (B08) bands",
                   "MSI from SWIR (B11) / NIR (B8A) — open water pixels excluded",
-                  "Bi-weekly observations across your date range",
-                  `Cloud scenes (>${cloudCoverMax}%) excluded; fallback to least-cloudy`,
+                  "One image per 14-day window across your date range",
+                  "Only images with ≤20% cloud over the field; if a window has none, the nearest such image up to 7 days away",
+                  "Cloud, cirrus and cloud-shadow pixels removed from every average and map",
                   "Dual NDVI + MSI time-series chart",
                   "Automatic crop stress alerts every 2 weeks",
                   "Spatial NDVI + MSI false-colour maps per observation date",
