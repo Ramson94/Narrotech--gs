@@ -128,6 +128,11 @@ const DAILY_EVALSCRIPT = [
   "      { id: 'clear', bands: 1, sampleType: 'FLOAT32' },",
   "      { id: 'cloud', bands: 1, sampleType: 'FLOAT32' },",
   "      { id: 'water', bands: 1, sampleType: 'FLOAT32' },",
+  // Breakdown of the cloud total, used only to explain rejected images.
+  "      { id: 'opaque', bands: 1, sampleType: 'FLOAT32' },",
+  "      { id: 'cirrus', bands: 1, sampleType: 'FLOAT32' },",
+  "      { id: 'shadow', bands: 1, sampleType: 'FLOAT32' },",
+  "      { id: 'nodata', bands: 1, sampleType: 'FLOAT32' },",
   "      { id: 'dataMask', bands: 1 }",
   "    ],",
   "    mosaicking: 'SIMPLE'",
@@ -142,11 +147,17 @@ const DAILY_EVALSCRIPT = [
   "  var ndvi = clear ? (s.B08 - s.B04) / d1 : 0;",
   "  var msi = clear ? s.B11 / s.B8A : 0;",
   // dataMask output = 1 for every pixel in the field, so no-data pixels count as cloud.
-  "  return { ndvi: [ndvi * clear], msi: [msi * clear], clear: [clear], cloud: [cloud ? 1 : 0], water: [water ? 1 : 0], dataMask: [1] };",
+  "  var opaque = !noData && (s.SCL === 8 || s.SCL === 9) ? 1 : 0;",
+  "  var cirrus = !noData && s.SCL === 10 ? 1 : 0;",
+  "  var shadow = !noData && s.SCL === 3 ? 1 : 0;",
+  "  return { ndvi: [ndvi * clear], msi: [msi * clear], clear: [clear], cloud: [cloud ? 1 : 0], water: [water ? 1 : 0],",
+  "           opaque: [opaque], cirrus: [cirrus], shadow: [shadow], nodata: [noData ? 1 : 0], dataMask: [1] };",
   "}"
 ].join("\n");
 
 const STATS_CHUNK_DAYS = 60;
+
+class SatelliteServiceError extends Error {}
 
 async function fetchDailyChunk(token: string, geometry: object, bbox: number[], from: string, to: string): Promise<DailyObservation[]> {
   const { width, height } = gridSize(bbox, 10, 32, 256);
@@ -179,9 +190,20 @@ async function fetchDailyChunk(token: string, geometry: object, bbox: number[], 
       if (!res.ok) { lastErr = `${res.status} ${(await res.text()).slice(0, 300)}`; continue; }
       const json = await res.json();
       const out: DailyObservation[] = [];
-      for (const iv of (json?.data || []) as any[]) {
+      const intervals: any[] = json?.data || [];
+      // Days the service could not process come back with an `error` instead of outputs.
+      // Never drop them silently: if every day failed, report the service's own message.
+      const failed = intervals.filter(iv => iv?.error);
+      if (failed.length) {
+        console.warn(`Statistics API: ${failed.length}/${intervals.length} days returned errors (${from}..${to}):`, JSON.stringify(failed[0].error).slice(0, 300));
+        if (failed.length === intervals.length) {
+          throw new SatelliteServiceError(`The satellite service could not process this field (${failed.length} days failed). Service message: ${String(failed[0].error?.message || JSON.stringify(failed[0].error)).slice(0, 250)}`);
+        }
+      }
+      for (const iv of intervals) {
         const st = (id: string) => iv?.outputs?.[id]?.bands?.B0?.stats;
         const cloud = st("cloud"), clear = st("clear"), water = st("water");
+        const pct = (x: any) => (typeof x?.mean === "number" ? Math.round(x.mean * 1000) / 10 : 0);
         if (!cloud || typeof cloud.mean !== "number" || !(cloud.sampleCount > 0)) continue;
         const clearFrac = typeof clear?.mean === "number" ? clear.mean : 0;
         const ndviSum = st("ndvi")?.mean, msiSum = st("msi")?.mean;
@@ -193,10 +215,14 @@ async function fetchDailyChunk(token: string, geometry: object, bbox: number[], 
           waterPct: Math.round((water?.mean ?? 0) * 1000) / 10,
           ndvi: ndvi !== null && ndvi >= -1 && ndvi <= 1 ? Math.round(ndvi * 1000) / 1000 : null,
           msi: msi !== null && msi > 0 && msi < 10 ? Math.round(msi * 1000) / 1000 : null,
+          breakdown: {
+            opaque: pct(st("opaque")), cirrus: pct(st("cirrus")), shadow: pct(st("shadow")), noData: pct(st("nodata")),
+          },
         });
       }
       return out;
     } catch (err) {
+      if (err instanceof SatelliteServiceError) throw err;
       lastErr = String(err);
     }
   }
@@ -529,6 +555,21 @@ function optramDateMoisture(
   return Math.round((sum / cnt) * 1000) / 1000;
 }
 
+// Plain-language explanation of why no image passed the 20% rule, so the user can see whether
+// it is genuine cloud, cirrus/shadow flagging, missing data, or no satellite passes at all.
+function explainNoQualifyingImage(daily: DailyObservation[], dateFrom: string, dateTo: string): string {
+  const head = `No Sentinel-2 L2A image with ${MAX_FIELD_CLOUD_PCT}% or less cloud over this field was found between ${dateFrom} and ${dateTo}.`;
+  if (daily.length === 0) {
+    return `${head} The satellite service returned no passes at all for this field. Check that the field boundary is correct (inside Ghana, not a line or a single point) and that the dates are not in the future.`;
+  }
+  const best = [...daily].sort((a, b) => a.cloudPct - b.cloudPct)[0];
+  const b = best.breakdown;
+  const parts = b ? ` (cloud ${b.opaque}%, thin cirrus ${b.cirrus}%, cloud shadow ${b.shadow}%, missing data ${b.noData}%)` : "";
+  const noClearLand = best.cloudPct <= MAX_FIELD_CLOUD_PCT && best.ndvi === null
+    ? " That pass had no clear land pixels left after removing water." : "";
+  return `${head} ${daily.length} satellite passes were checked. The clearest was ${best.date} with ${best.cloudPct}% of the field flagged${parts}.${noClearLand} Try a longer date range or a drier season.`;
+}
+
 // ─── Main analysis: pick one qualifying image per 14-day window ─────────────
 type SeriesPoint = {
   date: string; ndvi: number | null; ndwi: number | null; soilMoisture: number | null;
@@ -549,6 +590,10 @@ async function fetchSentinelHubData(coordinates: LatLng[], dateFrom: string, dat
   const fetchTo = addDays(dateTo, FALLBACK_DAYS) > today ? today : addDays(dateTo, FALLBACK_DAYS);
   const daily = await fetchDailyObservations(token, coordinates, addDays(dateFrom, -FALLBACK_DAYS), fetchTo);
   const picks = selectImagesForWindows(windows, daily);
+  for (const d of daily) {
+    const b = d.breakdown;
+    console.log(`  pass ${d.date}: field cloud ${d.cloudPct}%` + (b ? ` [cloud ${b.opaque} cirrus ${b.cirrus} shadow ${b.shadow} missing ${b.noData}]` : "") + ` water ${d.waterPct}% ndvi ${d.ndvi}`);
+  }
   console.log(`Sentinel-2: ${daily.length} acquisitions found, ${daily.filter(d => d.cloudPct <= MAX_FIELD_CLOUD_PCT).length} with ≤${MAX_FIELD_CLOUD_PCT}% field cloud; ${picks.filter(p => p.obs).length}/${windows.length} windows filled`);
 
   const results: SeriesPoint[] = picks.map(({ window, obs, fallback }) => {
@@ -569,7 +614,7 @@ async function fetchSentinelHubData(coordinates: LatLng[], dateFrom: string, dat
   });
 
   if (!results.some(r => !r.excluded)) {
-    throw new Error(`No Sentinel-2 image with ${MAX_FIELD_CLOUD_PCT}% or less cloud over this field was found in the selected period. Try a longer date range.`);
+    throw new Error(explainNoQualifyingImage(daily, dateFrom, dateTo));
   }
 
   // ── OPTRAM per-pixel calibration across all selected images ──
