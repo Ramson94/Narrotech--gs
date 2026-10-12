@@ -167,7 +167,14 @@ export default function Dashboard() {
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ["/api/fields"] });
       queryClient.invalidateQueries({ queryKey: ["/api/alerts"] });
-      toast({ title: `Bi-weekly check complete`, description: `${data.checked} field(s) updated.` });
+      const failed = (data.results ?? []).filter((r: any) => r.error);
+      toast({
+        title: `Bi-weekly check complete`,
+        description: failed.length
+          ? `${data.checked - failed.length} of ${data.checked} field(s) updated. No satellite data for: ${failed.map((r: any) => r.name).join(", ")}.`
+          : `${data.checked} field(s) updated.`,
+        variant: failed.length ? "destructive" : undefined,
+      });
     },
   });
 
@@ -214,8 +221,8 @@ export default function Dashboard() {
       {sentinelStatus && !sentinelStatus.connected && (
         <div className="flex items-center gap-2 text-xs px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/40 text-amber-700 dark:text-amber-400">
           <SatelliteDish size={12} />
-          <span className="font-medium">Simulation mode active.</span>
-          <span className="text-amber-600/70 dark:text-amber-500/70">Share your SentinelHub API token in chat to enable real satellite data.</span>
+          <span className="font-medium">Satellite connection unavailable.</span>
+          <span className="text-amber-600/70 dark:text-amber-500/70">New analyses will not run until the Copernicus credentials are working.</span>
         </div>
       )}
 
