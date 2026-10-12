@@ -9,6 +9,9 @@ export const fields = sqliteTable("fields", {
   cropType: text("crop_type").notNull().default(""),
   // Coordinates stored as JSON string: [{lat, lng}, ...]
   coordinates: text("coordinates").notNull(),
+  // Full field shape as a GeoJSON MultiPolygon (all plots, holes cut out) — see shared/geometry.ts.
+  // This is the ONLY area used for analysis. `coordinates` keeps the first plot's outline for display.
+  geometry: text("geometry"),
   ndvi: real("ndvi"),
   ndwi: real("ndwi"),
   healthScore: integer("health_score"),

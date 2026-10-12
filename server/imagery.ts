@@ -15,7 +15,7 @@ export const WINDOW_DAYS = 14;
 export const SCL_CLOUD_CLASSES = [3, 8, 9, 10];
 export const SCL_WATER_CLASS = 6;
 
-export type LatLng = { lat: number; lng: number };
+export type { LatLng } from "@shared/geometry";
 export type Window = { from: string; to: string; mid: string };
 
 // One cloud-assessed acquisition date over the field.
@@ -98,19 +98,12 @@ export function selectImagesForWindows(
   return picks;
 }
 
-// ─── Geometry helpers ────────────────────────────────────────────────────────
-export function fieldGeometry(coords: LatLng[]) {
-  const ring = coords.map(c => [c.lng, c.lat]);
-  const [fx, fy] = ring[0];
-  const [lx, ly] = ring[ring.length - 1];
-  if (fx !== lx || fy !== ly) ring.push([fx, fy]);
-  return { type: "Polygon", coordinates: [ring] };
-}
+// ─── Geometry helpers (field shape = the only analysis area) ─────────────────
+import { shapeToGeoJSON, shapeBBox, pointInShape, type FieldShape } from "@shared/geometry";
+export type { FieldShape };
 
-export function bboxOf(coords: LatLng[], buffer = 0): [number, number, number, number] {
-  const lats = coords.map(c => c.lat), lngs = coords.map(c => c.lng);
-  return [Math.min(...lngs) - buffer, Math.min(...lats) - buffer, Math.max(...lngs) + buffer, Math.max(...lats) + buffer];
-}
+export const fieldGeometry = (shape: FieldShape) => shapeToGeoJSON(shape);
+export const bboxOf = (shape: FieldShape, buffer = 0) => shapeBBox(shape, buffer);
 
 // Raster size for a bbox at a target ground resolution, clamped per dimension.
 export function gridSize(bbox: number[], targetMeters: number, minDim: number, maxDim: number) {
@@ -119,4 +112,18 @@ export function gridSize(bbox: number[], targetMeters: number, minDim: number, m
   const hM = (bbox[3] - bbox[1]) * 111320;
   const clamp = (v: number) => Math.max(minDim, Math.min(maxDim, Math.round(v / targetMeters)));
   return { width: clamp(wM), height: clamp(hM) };
+}
+
+// Number of raster cells (of a width x height grid over the field's bounding box) whose centre lies
+// inside the field (inside a plot, not in a hole). The satellite service reports pixels outside the
+// field as "no data", so this is the reference count for how much of the FIELD is really missing.
+export function fieldPixelCount(shape: FieldShape, bbox: number[], width: number, height: number): number {
+  const [minLng, minLat, maxLng, maxLat] = bbox;
+  const dx = (maxLng - minLng) / width, dy = (maxLat - minLat) / height;
+  let n = 0;
+  for (let r = 0; r < height; r++) {
+    const lat = maxLat - (r + 0.5) * dy;
+    for (let c = 0; c < width; c++) if (pointInShape(lat, minLng + (c + 0.5) * dx, shape)) n++;
+  }
+  return n;
 }

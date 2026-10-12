@@ -8,9 +8,10 @@ import { generateFieldReport } from "./report";
 import { sendWhatsAppNotification, buildWhatsAppMessage } from "./whatsapp";
 import {
   MAX_FIELD_CLOUD_PCT, FALLBACK_DAYS, SCL_CLOUD_CLASSES, SCL_WATER_CLASS,
-  biweeklyWindows, selectImagesForWindows, fieldGeometry, bboxOf, gridSize, addDays,
-  type DailyObservation, type LatLng,
+  biweeklyWindows, selectImagesForWindows, fieldGeometry, bboxOf, gridSize, addDays, fieldPixelCount,
+  type DailyObservation,
 } from "./imagery";
+import { shapeFromField, pointInShape, type FieldShape } from "@shared/geometry";
 // ─── Auth middleware (inline to avoid esbuild hoisting issues) ─────────────
 import type { Request, Response, NextFunction } from "express";
 function requireAuth(req: Request, res: Response, next: NextFunction) {
@@ -146,12 +147,14 @@ const DAILY_EVALSCRIPT = [
   "  var clear = (!cloud && !water && d1 >= 0.01 && s.B8A >= 0.01) ? 1 : 0;",
   "  var ndvi = clear ? (s.B08 - s.B04) / d1 : 0;",
   "  var msi = clear ? s.B11 / s.B8A : 0;",
-  // dataMask output = 1 for every pixel in the field, so no-data pixels count as cloud.
+  // dataMask output = the input dataMask: 0 for pixels OUTSIDE the field polygon (and for genuinely
+  // missing pixels), so they are left out of the statistics. Missing pixels inside the field are
+  // then counted by comparing the valid-pixel count with the field's own pixel count.
   "  var opaque = !noData && (s.SCL === 8 || s.SCL === 9) ? 1 : 0;",
   "  var cirrus = !noData && s.SCL === 10 ? 1 : 0;",
   "  var shadow = !noData && s.SCL === 3 ? 1 : 0;",
   "  return { ndvi: [ndvi * clear], msi: [msi * clear], clear: [clear], cloud: [cloud ? 1 : 0], water: [water ? 1 : 0],",
-  "           opaque: [opaque], cirrus: [cirrus], shadow: [shadow], nodata: [noData ? 1 : 0], dataMask: [1] };",
+  "           opaque: [opaque], cirrus: [cirrus], shadow: [shadow], nodata: [noData ? 1 : 0], dataMask: [s.dataMask] };",
   "}"
 ].join("\n");
 
@@ -159,8 +162,8 @@ const STATS_CHUNK_DAYS = 60;
 
 class SatelliteServiceError extends Error {}
 
-async function fetchDailyChunk(token: string, geometry: object, bbox: number[], from: string, to: string): Promise<DailyObservation[]> {
-  const { width, height } = gridSize(bbox, 10, 32, 256);
+async function fetchDailyChunk(token: string, geometry: object, bbox: number[], grid: { width: number; height: number; fieldPixels: number }, from: string, to: string): Promise<DailyObservation[]> {
+  const { width, height, fieldPixels } = grid;
   const body = {
     input: {
       bounds: { geometry, properties: { crs: "http://www.opengis.net/def/crs/EPSG/0/4326" } },
@@ -203,20 +206,28 @@ async function fetchDailyChunk(token: string, geometry: object, bbox: number[], 
       for (const iv of intervals) {
         const st = (id: string) => iv?.outputs?.[id]?.bands?.B0?.stats;
         const cloud = st("cloud"), clear = st("clear"), water = st("water");
-        const pct = (x: any) => (typeof x?.mean === "number" ? Math.round(x.mean * 1000) / 10 : 0);
-        if (!cloud || typeof cloud.mean !== "number" || !(cloud.sampleCount > 0)) continue;
-        const clearFrac = typeof clear?.mean === "number" ? clear.mean : 0;
+        if (!cloud || !(cloud.sampleCount > 0)) continue;
+        // Share of the field that actually has data on this date (pixels outside the polygon are
+        // excluded by the service and are NOT missing data).
+        const validPixels = Math.max(0, cloud.sampleCount - (cloud.noDataCount ?? 0));
+        const validFrac = fieldPixels > 0 ? Math.min(1, validPixels / fieldPixels) : (validPixels > 0 ? 1 : 0);
+        const missingFrac = 1 - validFrac;
+        // Statistic means are over valid pixels; convert each to a share of the whole field.
+        const frac = (x: any) => (validFrac > 0 && typeof x?.mean === "number" && isFinite(x.mean) ? x.mean * validFrac : 0);
+        const pct = (f: number) => Math.round(f * 1000) / 10;
+        const clearFrac = validFrac > 0 && typeof clear?.mean === "number" && isFinite(clear.mean) ? clear.mean : 0;
         const ndviSum = st("ndvi")?.mean, msiSum = st("msi")?.mean;
         const ndvi = clearFrac > 0 && typeof ndviSum === "number" ? ndviSum / clearFrac : null;
         const msi = clearFrac > 0 && typeof msiSum === "number" ? msiSum / clearFrac : null;
         out.push({
           date: String(iv.interval?.from || "").slice(0, 10),
-          cloudPct: Math.round(cloud.mean * 1000) / 10,
-          waterPct: Math.round((water?.mean ?? 0) * 1000) / 10,
+          cloudPct: pct(Math.min(1, frac(cloud) + missingFrac)),
+          waterPct: pct(frac(water)),
           ndvi: ndvi !== null && ndvi >= -1 && ndvi <= 1 ? Math.round(ndvi * 1000) / 1000 : null,
           msi: msi !== null && msi > 0 && msi < 10 ? Math.round(msi * 1000) / 1000 : null,
           breakdown: {
-            opaque: pct(st("opaque")), cirrus: pct(st("cirrus")), shadow: pct(st("shadow")), noData: pct(st("nodata")),
+            opaque: pct(frac(st("opaque"))), cirrus: pct(frac(st("cirrus"))), shadow: pct(frac(st("shadow"))),
+            noData: pct(Math.min(1, frac(st("nodata")) + missingFrac)),
           },
         });
       }
@@ -229,15 +240,17 @@ async function fetchDailyChunk(token: string, geometry: object, bbox: number[], 
   throw new Error(`Satellite statistics request failed (${from} to ${to}): ${lastErr}`);
 }
 
-async function fetchDailyObservations(token: string, coords: LatLng[], from: string, to: string): Promise<DailyObservation[]> {
-  const geometry = fieldGeometry(coords);
-  const bbox = bboxOf(coords);
+async function fetchDailyObservations(token: string, shape: FieldShape, from: string, to: string): Promise<DailyObservation[]> {
+  const geometry = fieldGeometry(shape);
+  const bbox = bboxOf(shape);
+  const size = gridSize(bbox, 10, 32, 256);
+  const grid = { ...size, fieldPixels: fieldPixelCount(shape, bbox, size.width, size.height) };
   const chunks: { from: string; to: string }[] = [];
   for (let f = from; f <= to; f = addDays(f, STATS_CHUNK_DAYS)) {
     const t = addDays(f, STATS_CHUNK_DAYS - 1);
     chunks.push({ from: f, to: t > to ? to : t });
   }
-  const parts = await Promise.all(chunks.map(c => fetchDailyChunk(token, geometry, bbox, c.from, c.to)));
+  const parts = await Promise.all(chunks.map(c => fetchDailyChunk(token, geometry, bbox, grid, c.from, c.to)));
   const byDate = new Map<string, DailyObservation>();
   for (const o of parts.flat()) if (o.date) byDate.set(o.date, o);
   return Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date));
@@ -372,11 +385,11 @@ function decodeFloat32Tiff(buf: Buffer): { width: number; height: number; sample
 // valid (non-cloud, non-oversaturated) pixel as an (ndvi, str) pair.
 async function fetchOptramRaster(
   token: string,
-  coords: LatLng[],
+  shape: FieldShape,
   date: string
 ): Promise<PixelSample[]> {
-  // Exactly the qualifying image's acquisition date, clipped to the field polygon.
-  const bbox = bboxOf(coords);
+  // Exactly the qualifying image's acquisition date, clipped to the field shape (holes excluded).
+  const bbox = bboxOf(shape);
   const { width, height } = gridSize(bbox, OPTRAM_TARGET_METERS, 1, OPTRAM_MAX_DIM);
 
   const evalscript = [
@@ -405,7 +418,7 @@ async function fetchOptramRaster(
 
   const body = {
     input: {
-      bounds: { geometry: fieldGeometry(coords), properties: { crs: "http://www.opengis.net/def/crs/EPSG/0/4326" } },
+      bounds: { geometry: fieldGeometry(shape), properties: { crs: "http://www.opengis.net/def/crs/EPSG/0/4326" } },
       data: [{
         type: "sentinel-2-l2a",
         dataFilter: { timeRange: { from: `${date}T00:00:00Z`, to: `${date}T23:59:59Z` } }
@@ -577,7 +590,7 @@ type SeriesPoint = {
   windowFrom: string; windowTo: string;
 };
 
-async function fetchSentinelHubData(coordinates: LatLng[], dateFrom: string, dateTo: string): Promise<SeriesPoint[]> {
+async function fetchSentinelHubData(shape: FieldShape, dateFrom: string, dateTo: string): Promise<SeriesPoint[]> {
   // Satellite data only — there is no simulated fallback.
   const token = await getSentinelToken();
   if (!token) {
@@ -588,7 +601,7 @@ async function fetchSentinelHubData(coordinates: LatLng[], dateFrom: string, dat
   // Look FALLBACK_DAYS beyond the range so the first/last windows can also borrow a nearby image.
   const today = new Date().toISOString().slice(0, 10);
   const fetchTo = addDays(dateTo, FALLBACK_DAYS) > today ? today : addDays(dateTo, FALLBACK_DAYS);
-  const daily = await fetchDailyObservations(token, coordinates, addDays(dateFrom, -FALLBACK_DAYS), fetchTo);
+  const daily = await fetchDailyObservations(token, shape, addDays(dateFrom, -FALLBACK_DAYS), fetchTo);
   const picks = selectImagesForWindows(windows, daily);
   for (const d of daily) {
     const b = d.breakdown;
@@ -619,7 +632,7 @@ async function fetchSentinelHubData(coordinates: LatLng[], dateFrom: string, dat
 
   // ── OPTRAM per-pixel calibration across all selected images ──
   const rasters = await Promise.all(
-    results.map(r => (!r.excluded && !r.isWater ? fetchOptramRaster(token, coordinates, r.date) : Promise.resolve([] as PixelSample[])))
+    results.map(r => (!r.excluded && !r.isWater ? fetchOptramRaster(token, shape, r.date) : Promise.resolve([] as PixelSample[])))
   );
   const pool: PixelSample[] = [];
   for (const px of rasters) for (const p of px) pool.push(p);
@@ -723,8 +736,7 @@ async function runFieldAnalysis(
   if (!field) throw new Error("Field not found");
 
   const { dateFrom, dateTo } = opts;
-  const coords = JSON.parse(field.coordinates);
-  const timeSeriesData = await fetchSentinelHubData(coords, dateFrom, dateTo);
+  const timeSeriesData = await fetchSentinelHubData(shapeFromField(field), dateFrom, dateTo);
   const { ndvi, ndwi, healthScore } = computeAggregates(timeSeriesData);
 
   const updated = storage.updateField(field.id, {
@@ -868,10 +880,10 @@ export function registerRoutes(httpServer: Server, app: Express) {
     const results = [];
     for (const field of due) {
       try {
-        const coords = JSON.parse(field.coordinates);
+        const shape = shapeFromField(field);
         const dateFrom = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
         const dateTo = new Date().toISOString().split("T")[0];
-        const fresh = await fetchSentinelHubData(coords, dateFrom, dateTo);
+        const fresh = await fetchSentinelHubData(shape, dateFrom, dateTo);
         // Add the new observation to the field's existing history instead of replacing it.
         const previous: any[] = field.timeSeriesData ? JSON.parse(field.timeSeriesData) : [];
         const freshDates = new Set(fresh.map(p => p.date));
@@ -925,9 +937,9 @@ export function registerRoutes(httpServer: Server, app: Express) {
       if (type !== "ndvi" && type !== "msi") return res.status(400).json({ error: "type must be ndvi or msi" });
       if (!qualifyingDate(field, date)) return res.status(400).json({ error: NOT_QUALIFYING });
 
-      const coords = JSON.parse(field.coordinates) as { lat: number; lng: number }[];
-      // Small buffer (~500m) so the field isn't clipped at the edge
-      const bbox = bboxOf(coords, 0.005);
+      const shape = shapeFromField(field);
+      // Small buffer (~500m) around the field; everything outside the field is made transparent below.
+      const bbox = bboxOf(shape, 0.005);
 
       const token = await getSentinelToken();
       if (!token) {
@@ -999,16 +1011,73 @@ export function registerRoutes(httpServer: Server, app: Express) {
         return res.status(imgRes.status).json({ error: "Map rendering failed", detail: err.slice(0, 200) });
       }
 
-      const buf2 = await imgRes.arrayBuffer();
+      // Make every pixel outside the field boundary transparent, so the map shows only the field.
+      const rendered = decodePNG(Buffer.from(await imgRes.arrayBuffer()));
+      const clipped = clipPngToField(rendered, bbox, shape);
       res.set("Content-Type", "image/png");
       res.set("Cache-Control", "public, max-age=86400"); // cache 24h — same date always gives same image
-      res.send(Buffer.from(buf2));
+      res.send(clipped);
     } catch (err) {
       console.error("Map route error:", err);
       res.status(500).json({ error: "Map rendering failed", detail: String(err) });
     }
   });
 
+
+  // ─── Clip a rendered map to the field boundary (RGBA PNG, transparent outside) ──
+  function clipPngToField(
+    png: { width: number; height: number; channels: number; pixels: Buffer },
+    bbox: number[], shape: FieldShape,
+  ): Buffer {
+    const { width, height, channels, pixels } = png;
+    const [minLng, minLat, maxLng, maxLat] = bbox;
+    const rgba = Buffer.alloc(width * height * 4);
+    for (let y = 0; y < height; y++) {
+      const lat = maxLat - ((y + 0.5) / height) * (maxLat - minLat);
+      for (let x = 0; x < width; x++) {
+        const lng = minLng + ((x + 0.5) / width) * (maxLng - minLng);
+        const src = (y * width + x) * channels, dst = (y * width + x) * 4;
+        const gray = channels < 3;
+        rgba[dst] = pixels[src];
+        rgba[dst + 1] = gray ? pixels[src] : pixels[src + 1];
+        rgba[dst + 2] = gray ? pixels[src] : pixels[src + 2];
+        rgba[dst + 3] = pointInShape(lat, lng, shape) ? 255 : 0;
+      }
+    }
+    return encodePNG(width, height, rgba);
+  }
+
+  // Minimal RGBA PNG encoder (filter 0, zlib deflate) — avoids an image dependency.
+  const CRC_TABLE = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+    return t;
+  })();
+  function crc32(buf: Buffer): number {
+    let c = 0xffffffff;
+    for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  }
+  function encodePNG(width: number, height: number, rgba: Buffer): Buffer {
+    const chunk = (type: string, data: Buffer) => {
+      const len = Buffer.alloc(4); len.writeUInt32BE(data.length);
+      const td = Buffer.concat([Buffer.from(type, "ascii"), data]);
+      const crc = Buffer.alloc(4); crc.writeUInt32BE(crc32(td));
+      return Buffer.concat([len, td, crc]);
+    };
+    const ihdr = Buffer.alloc(13);
+    ihdr.writeUInt32BE(width, 0); ihdr.writeUInt32BE(height, 4);
+    ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0; // 8-bit RGBA
+    const raw = Buffer.alloc(height * (width * 4 + 1));
+    for (let y = 0; y < height; y++) {
+      raw[y * (width * 4 + 1)] = 0;
+      rgba.copy(raw, y * (width * 4 + 1) + 1, y * width * 4, (y + 1) * width * 4);
+    }
+    return Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      chunk("IHDR", ihdr), chunk("IDAT", zlib.deflateSync(raw)), chunk("IEND", Buffer.alloc(0)),
+    ]);
+  }
 
   // ─── Minimal dependency-free PNG decoder (grayscale/RGB, 8-bit) ────────────
   // Decodes IHDR + IDAT chunks manually via zlib.inflateSync — avoids adding
@@ -1070,19 +1139,6 @@ export function registerRoutes(httpServer: Server, app: Express) {
       prevRow = outRow;
     }
     return { width, height, channels, pixels };
-  }
-
-  // Point-in-polygon test (ray casting) — coords is [{lat,lng}, ...]
-  function pointInPolygon(lat: number, lng: number, coords: { lat: number; lng: number }[]): boolean {
-    let inside = false;
-    for (let i = 0, j = coords.length - 1; i < coords.length; j = i++) {
-      const xi = coords[i].lng, yi = coords[i].lat;
-      const xj = coords[j].lng, yj = coords[j].lat;
-      const intersect = ((yi > lat) !== (yj > lat)) &&
-        (lng < ((xj - xi) * (lat - yi)) / (yj - yi) + xi);
-      if (intersect) inside = !inside;
-    }
-    return inside;
   }
 
   // ─── DBSCAN clustering over grid cells ──────────────────────────────────────
@@ -1151,12 +1207,9 @@ export function registerRoutes(httpServer: Server, app: Express) {
       if (!qualifyingDate(field, date)) return res.status(400).json({ error: NOT_QUALIFYING });
       const limit = Math.max(1, Math.min(10, parseInt(maxZones) || 5));
 
-      const coords = JSON.parse(field.coordinates) as { lat: number; lng: number }[];
-      const lats = coords.map(c => c.lat);
-      const lngs = coords.map(c => c.lng);
-      const buf = 0.002; // smaller buffer than the display map — we want the grid tight to the field
-      const minLng = Math.min(...lngs) - buf, minLat = Math.min(...lats) - buf;
-      const maxLng = Math.max(...lngs) + buf, maxLat = Math.max(...lats) + buf;
+      const shape = shapeFromField(field);
+      // Small buffer — the grid stays tight to the field; cells outside the field are discarded.
+      const [minLng, minLat, maxLng, maxLat] = bboxOf(shape, 0.002);
       const bbox = [minLng, minLat, maxLng, maxLat];
 
       const token = await getSentinelToken();
@@ -1245,7 +1298,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
           // Cell center lat/lng (image row 0 = top = maxLat)
           const lng = minLng + (col + 0.5) * lngStep;
           const lat = maxLat - (row + 0.5) * latStep;
-          if (!pointInPolygon(lat, lng, coords)) continue; // only keep cells inside the actual field shape
+          if (!pointInShape(lat, lng, shape)) continue; // only cells inside the field (plots, not holes)
           const value = raw / 254; // normalized 0-1
           cells.push({ row, col, lat, lng, value, raw });
         }
