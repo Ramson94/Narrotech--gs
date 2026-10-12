@@ -32,7 +32,7 @@ export async function apiRequest(
 // ({ field, timeSeriesData, notificationSent }), so callers are unchanged.
 export async function runAnalyzeJob(
   fieldId: number,
-  body?: { dateFrom?: string; dateTo?: string; cloudCoverMax?: number },
+  body?: { dateFrom?: string; dateTo?: string },
   opts?: { intervalMs?: number; timeoutMs?: number },
 ): Promise<any> {
   const intervalMs = opts?.intervalMs ?? 2500;

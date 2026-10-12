@@ -6,6 +6,11 @@ import { storage } from "./storage";
 import { insertFieldSchema } from "@shared/schema";
 import { generateFieldReport } from "./report";
 import { sendWhatsAppNotification, buildWhatsAppMessage } from "./whatsapp";
+import {
+  MAX_FIELD_CLOUD_PCT, FALLBACK_DAYS, SCL_CLOUD_CLASSES, SCL_WATER_CLASS,
+  biweeklyWindows, selectImagesForWindows, fieldGeometry, bboxOf, gridSize, addDays,
+  type DailyObservation, type LatLng,
+} from "./imagery";
 // ─── Auth middleware (inline to avoid esbuild hoisting issues) ─────────────
 import type { Request, Response, NextFunction } from "express";
 function requireAuth(req: Request, res: Response, next: NextFunction) {
@@ -103,169 +108,113 @@ function classifyNdvi(ndvi: number) {
   if (ndvi >= 0.1) return "Poor";
   return "Critical";
 }
+void classifyNdvi;
 
-/**
- * Classify a pixel based on EVI (Enhanced Vegetation Index).
- * EVI = 2.5 * (NIR-Red) / (NIR + 6*Red - 7.5*Blue + 1)
- * EVI improves on NDVI by correcting for atmospheric and soil-background
- * effects and reducing saturation over dense canopy.
- */
-function classifyEvi(evi: number) {
-  if (evi >= 0.5) return "Excellent";
-  if (evi >= 0.35) return "Good";
-  if (evi >= 0.2) return "Moderate";
-  if (evi >= 0.1) return "Poor";
-  return "Critical";
-}
+// ─── Daily field observations (Statistics API, field polygon) ──────────────
+// One request returns, for every Sentinel-2 L2A acquisition date in the range, how cloudy the FIELD
+// is and the mean NDVI / MSI over its clear land pixels. Pixels outside the field polygon are
+// ignored by the API. Means are computed as mean(value×clear) / mean(clear) so cloudy, shadowed,
+// water and no-data pixels never enter the average, while every field pixel counts toward the
+// cloud percentage.
+const SCL_CLOUD_JS = JSON.stringify(SCL_CLOUD_CLASSES);
+const DAILY_EVALSCRIPT = [
+  "//VERSION=3",
+  "function setup() {",
+  "  return {",
+  "    input: [{ bands: ['B04','B08','B8A','B11','SCL','dataMask'] }],",
+  "    output: [",
+  "      { id: 'ndvi',  bands: 1, sampleType: 'FLOAT32' },",
+  "      { id: 'msi',   bands: 1, sampleType: 'FLOAT32' },",
+  "      { id: 'clear', bands: 1, sampleType: 'FLOAT32' },",
+  "      { id: 'cloud', bands: 1, sampleType: 'FLOAT32' },",
+  "      { id: 'water', bands: 1, sampleType: 'FLOAT32' },",
+  "      { id: 'dataMask', bands: 1 }",
+  "    ],",
+  "    mosaicking: 'SIMPLE'",
+  "  };",
+  "}",
+  "function evaluatePixel(s) {",
+  "  var noData = s.dataMask === 0 || s.SCL === 0 || s.SCL === 1;",
+  `  var cloud = noData || ${SCL_CLOUD_JS}.indexOf(s.SCL) >= 0;`,
+  `  var water = !cloud && s.SCL === ${SCL_WATER_CLASS};`,
+  "  var d1 = s.B08 + s.B04;",
+  "  var clear = (!cloud && !water && d1 >= 0.01 && s.B8A >= 0.01) ? 1 : 0;",
+  "  var ndvi = clear ? (s.B08 - s.B04) / d1 : 0;",
+  "  var msi = clear ? s.B11 / s.B8A : 0;",
+  // dataMask output = 1 for every pixel in the field, so no-data pixels count as cloud.
+  "  return { ndvi: [ndvi * clear], msi: [msi * clear], clear: [clear], cloud: [cloud ? 1 : 0], water: [water ? 1 : 0], dataMask: [1] };",
+  "}"
+].join("\n");
 
-// ─── SentinelHub real API call ─────────────────────────────────────────────
-// ─── Helper: generate bi-weekly date windows between two dates ────────────
-function biweeklyWindows(dateFrom: string, dateTo: string): { from: string; to: string; mid: string }[] {
-  const windows: { from: string; to: string; mid: string }[] = [];
-  let cursor = new Date(dateFrom);
-  const end = new Date(dateTo);
-  while (cursor <= end) {
-    const winEnd = new Date(cursor);
-    winEnd.setDate(winEnd.getDate() + 13);
-    if (winEnd > end) winEnd.setTime(end.getTime());
-    const mid = new Date(cursor);
-    mid.setDate(mid.getDate() + 7);
-    windows.push({
-      from: cursor.toISOString().split("T")[0],
-      to: winEnd.toISOString().split("T")[0],
-      mid: mid > end ? end.toISOString().split("T")[0] : mid.toISOString().split("T")[0]
-    });
-    cursor = new Date(winEnd);
-    cursor.setDate(cursor.getDate() + 1);
-  }
-  return windows;
-}
+const STATS_CHUNK_DAYS = 60;
 
-// ─── Single-window Sentinel Hub statistical API call ─────────────────────
-// Uses P1D intervals to find ALL scenes in the window, then picks the best one.
-// P14D was returning empty data from CDSE — daily intervals work reliably.
-async function fetchOneWindow(
-  token: string,
-  bbox: number[],
-  winFrom: string,
-  winTo: string,
-  cloudCoverMax: number
-): Promise<{ ndvi: number | null; msi: number | null; evi: number | null; cloudCover: number; noData: boolean }> {
-
-  // Build evalscript as array-join to avoid template literal serialization issues with esbuild.
-  // This Statistics-API call powers NDVI/MSI/EVI only. OPTRAM soil-moisture is NOT computed here
-  // anymore: aggregate per-date stats collapse the whole field to one point per date, which is far
-  // too few samples to fit a physically-meaningful STR-vs-NDVI trapezoid. OPTRAM instead pulls raw
-  // per-pixel rasters from the Process API (see fetchOptramRaster / fitOptramEdges below).
-  const evalscript = [
-    "//VERSION=3",
-    "function setup() {",
-    "  return {",
-    "    input: [{ bands: ['B02','B04','B08','B8A','B11','SCL'] }],",
-    "    output: [",
-    "      { id: 'ndvi',     bands: 1, sampleType: 'FLOAT32' },",
-    "      { id: 'msi',      bands: 1, sampleType: 'FLOAT32' },",
-    "      { id: 'evi',      bands: 1, sampleType: 'FLOAT32' },",
-    "      { id: 'dataMask', bands: 1, sampleType: 'UINT8'   }",
-    "    ],",
-    "    mosaicking: 'SIMPLE'",
-    "  };",
-    "}",
-    "function evaluatePixel(s) {",
-    "  var scl = s.SCL;",
-    "  if ([8,9,10,3].includes(scl) || scl === 6) return { ndvi:[0], msi:[0], evi:[0], dataMask:[0] };",
-    "  var n=s.B08, r=s.B04, nir8a=s.B8A, sw=s.B11, b=s.B02;",
-    "  var d1=n+r, d2=nir8a;",
-    "  if (d1 < 0.01 || d2 < 0.01) return { ndvi:[0], msi:[0], evi:[0], dataMask:[0] };",
-    "  var eviDen = n + 6*r - 7.5*b + 1;",
-    "  var evi = Math.abs(eviDen) < 0.01 ? 0 : 2.5*(n-r)/eviDen;",
-    "  return { ndvi:[(n-r)/d1], msi:[sw/d2], evi:[evi], dataMask:[1] };",
-    "}"
-  ].join("\n");
-
+async function fetchDailyChunk(token: string, geometry: object, bbox: number[], from: string, to: string): Promise<DailyObservation[]> {
+  const { width, height } = gridSize(bbox, 10, 32, 256);
   const body = {
     input: {
-      bounds: { bbox, properties: { crs: "http://www.opengis.net/def/crs/EPSG/0/4326" } },
-      data: [{
-        type: "sentinel-2-l2a",
-        dataFilter: {
-          timeRange: { from: `${winFrom}T00:00:00Z`, to: `${winTo}T23:59:59Z` },
-          maxCloudCoverage: cloudCoverMax
-        }
-      }]
+      bounds: { geometry, properties: { crs: "http://www.opengis.net/def/crs/EPSG/0/4326" } },
+      data: [{ type: "sentinel-2-l2a", dataFilter: { timeRange: { from: `${from}T00:00:00Z`, to: `${to}T23:59:59Z` } } }]
     },
     aggregation: {
-      timeRange: { from: `${winFrom}T00:00:00Z`, to: `${winTo}T23:59:59Z` },
-      aggregationInterval: { of: "P1D" },  // P1D: one result per day with imagery
-      width: 64, height: 64,
-      evalscript  // inside aggregation — required by Statistics API
+      timeRange: { from: `${from}T00:00:00Z`, to: `${to}T23:59:59Z` },
+      aggregationInterval: { of: "P1D" },
+      width, height,
+      evalscript: DAILY_EVALSCRIPT
     },
-    calculations: {
-      ndvi: { statistics: { default: {} } },
-      msi:  { statistics: { default: {} } },
-      evi:  { statistics: { default: {} } }
-    }
+    calculations: { default: {} }
   };
 
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000);
-    const res = await fetch(SENTINEL_STATS_API, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${token}`,
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal
-    });
-    clearTimeout(timeout);
-
-    if (!res.ok) {
-      const errText = await res.text();
-      console.warn("Stats API error:", res.status, errText.slice(0, 400));
-      return { ndvi: null, msi: null, evi: null, cloudCover: 100, noData: true };
-    }
-    const json = await res.json();
-    const intervals: any[] = json?.data || [];
-    if (!intervals.length) return { ndvi: null, msi: null, evi: null, cloudCover: 100, noData: true };
-
-    // Pick the best daily observation: highest valid-pixel ratio, sensible NDVI
-    let best: { ndvi: number; msi: number | null; evi: number | null; cloudCover: number } | null = null;
-    let bestValidRatio = -1;
-
-    for (const iv of intervals) {
-      const ns = iv?.outputs?.ndvi?.bands?.B0?.stats;
-      const ms = iv?.outputs?.msi?.bands?.B0?.stats;
-      const es = iv?.outputs?.evi?.bands?.B0?.stats;
-      if (!ns || ns.sampleCount === 0) continue;
-      const validRatio = 1 - (ns.noDataCount / ns.sampleCount);
-      if (validRatio < 0.05) continue;  // less than 5% valid pixels — skip
-      const ndviMean = ns.mean;
-      const msiMean  = ms?.mean ?? null;
-      const eviMean  = es?.mean ?? null;
-      if (typeof ndviMean !== "number" || ndviMean < -1.5 || ndviMean > 1.5) continue;
-      if (validRatio > bestValidRatio) {
-        bestValidRatio = validRatio;
-        best = {
-          ndvi: Math.round(ndviMean * 1000) / 1000,
-          msi:  (typeof msiMean === "number" && msiMean > 0.05 && msiMean < 10)
-                ? Math.round(msiMean * 1000) / 1000 : null,
-          evi:  (typeof eviMean === "number" && eviMean > -1.5 && eviMean < 1.5)
-                ? Math.round(eviMean * 1000) / 1000 : null,
-          cloudCover: Math.round((1 - validRatio) * 100)
-        };
+  let lastErr = "";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 60000);
+      const res = await fetch(SENTINEL_STATS_API, {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "Accept": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+      if (!res.ok) { lastErr = `${res.status} ${(await res.text()).slice(0, 300)}`; continue; }
+      const json = await res.json();
+      const out: DailyObservation[] = [];
+      for (const iv of (json?.data || []) as any[]) {
+        const st = (id: string) => iv?.outputs?.[id]?.bands?.B0?.stats;
+        const cloud = st("cloud"), clear = st("clear"), water = st("water");
+        if (!cloud || typeof cloud.mean !== "number" || !(cloud.sampleCount > 0)) continue;
+        const clearFrac = typeof clear?.mean === "number" ? clear.mean : 0;
+        const ndviSum = st("ndvi")?.mean, msiSum = st("msi")?.mean;
+        const ndvi = clearFrac > 0 && typeof ndviSum === "number" ? ndviSum / clearFrac : null;
+        const msi = clearFrac > 0 && typeof msiSum === "number" ? msiSum / clearFrac : null;
+        out.push({
+          date: String(iv.interval?.from || "").slice(0, 10),
+          cloudPct: Math.round(cloud.mean * 1000) / 10,
+          waterPct: Math.round((water?.mean ?? 0) * 1000) / 10,
+          ndvi: ndvi !== null && ndvi >= -1 && ndvi <= 1 ? Math.round(ndvi * 1000) / 1000 : null,
+          msi: msi !== null && msi > 0 && msi < 10 ? Math.round(msi * 1000) / 1000 : null,
+        });
       }
+      return out;
+    } catch (err) {
+      lastErr = String(err);
     }
-
-    if (!best) return { ndvi: null, msi: null, evi: null, cloudCover: 100, noData: true };
-    return { ...best, noData: false };
-
-  } catch (err) {
-    console.warn("Stats API window fetch error:", err);
-    return { ndvi: null, msi: null, evi: null, cloudCover: 100, noData: true };
   }
+  throw new Error(`Satellite statistics request failed (${from} to ${to}): ${lastErr}`);
+}
+
+async function fetchDailyObservations(token: string, coords: LatLng[], from: string, to: string): Promise<DailyObservation[]> {
+  const geometry = fieldGeometry(coords);
+  const bbox = bboxOf(coords);
+  const chunks: { from: string; to: string }[] = [];
+  for (let f = from; f <= to; f = addDays(f, STATS_CHUNK_DAYS)) {
+    const t = addDays(f, STATS_CHUNK_DAYS - 1);
+    chunks.push({ from: f, to: t > to ? to : t });
+  }
+  const parts = await Promise.all(chunks.map(c => fetchDailyChunk(token, geometry, bbox, c.from, c.to)));
+  const byDate = new Map<string, DailyObservation>();
+  for (const o of parts.flat()) if (o.date) byDate.set(o.date, o);
+  return Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date));
 }
 
 // ─── OPTRAM soil-moisture calibration (per-pixel, Process API) ─────────────
@@ -397,25 +346,18 @@ function decodeFloat32Tiff(buf: Buffer): { width: number; height: number; sample
 // valid (non-cloud, non-oversaturated) pixel as an (ndvi, str) pair.
 async function fetchOptramRaster(
   token: string,
-  bbox: number[],
-  winFrom: string,
-  winTo: string,
-  cloudCoverMax: number
+  coords: LatLng[],
+  date: string
 ): Promise<PixelSample[]> {
-  // Output size from the target ground resolution, capped per dimension.
-  const midLat = (bbox[1] + bbox[3]) / 2;
-  const mPerDegLat = 111320;
-  const mPerDegLng = 111320 * Math.cos((midLat * Math.PI) / 180);
-  const wMeters = (bbox[2] - bbox[0]) * mPerDegLng;
-  const hMeters = (bbox[3] - bbox[1]) * mPerDegLat;
-  const width = Math.max(1, Math.min(OPTRAM_MAX_DIM, Math.round(wMeters / OPTRAM_TARGET_METERS)));
-  const height = Math.max(1, Math.min(OPTRAM_MAX_DIM, Math.round(hMeters / OPTRAM_TARGET_METERS)));
+  // Exactly the qualifying image's acquisition date, clipped to the field polygon.
+  const bbox = bboxOf(coords);
+  const { width, height } = gridSize(bbox, OPTRAM_TARGET_METERS, 1, OPTRAM_MAX_DIM);
 
   const evalscript = [
     "//VERSION=3",
     "function setup() {",
     "  return {",
-    "    input: [{ bands: ['B04','B08','B11','SCL'] }],",
+    "    input: [{ bands: ['B04','B08','B11','SCL','dataMask'] }],",
     "    output: { bands: 3, sampleType: 'FLOAT32' },",
     "    mosaicking: 'SIMPLE'",
     "  };",
@@ -423,7 +365,7 @@ async function fetchOptramRaster(
     "function evaluatePixel(s) {",
     // Reuse the same SCL cloud/shadow/water mask as the rest of the pipeline (3,6,8,9,10).
     "  var scl = s.SCL;",
-    "  var bad = ([8,9,10,3].includes(scl) || scl === 6) ? 1 : 0;",
+    `  var bad = (s.dataMask === 0 || scl === 0 || scl === 1 || ${SCL_CLOUD_JS}.indexOf(scl) >= 0 || scl === ${SCL_WATER_CLASS}) ? 1 : 0;`,
     "  var n = s.B08, r = s.B04, sw = s.B11;",
     "  var d = n + r;",
     "  var ndvi = d < 0.01 ? 0 : (n - r) / d;",
@@ -437,14 +379,10 @@ async function fetchOptramRaster(
 
   const body = {
     input: {
-      bounds: { bbox, properties: { crs: "http://www.opengis.net/def/crs/EPSG/0/4326" } },
+      bounds: { geometry: fieldGeometry(coords), properties: { crs: "http://www.opengis.net/def/crs/EPSG/0/4326" } },
       data: [{
         type: "sentinel-2-l2a",
-        dataFilter: {
-          timeRange: { from: `${winFrom}T00:00:00Z`, to: `${winTo}T23:59:59Z` },
-          maxCloudCoverage: cloudCoverMax,
-          mosaickingOrder: "leastCC"
-        }
+        dataFilter: { timeRange: { from: `${date}T00:00:00Z`, to: `${date}T23:59:59Z` } }
       }]
     },
     output: { width, height, responses: [{ identifier: "default", format: { type: "image/tiff" } }] },
@@ -591,124 +529,74 @@ function optramDateMoisture(
   return Math.round((sum / cnt) * 1000) / 1000;
 }
 
-// ─── Main SentinelHub real-data function: iterate bi-weekly windows ────────
-async function fetchSentinelHubData(
-  coordinates: { lat: number; lng: number }[],
-  dateFrom: string,
-  dateTo: string,
-  cloudCoverMax: number
-): Promise<{ ndvi: number | null; ndwi: number | null; evi: number | null; soilMoisture: number | null; cloudCover: number; isWater: boolean; date: string; dataSource: string; excluded?: boolean }[]> {
+// ─── Main analysis: pick one qualifying image per 14-day window ─────────────
+type SeriesPoint = {
+  date: string; ndvi: number | null; ndwi: number | null; soilMoisture: number | null;
+  cloudCover: number | null; isWater: boolean; dataSource: string; excluded?: boolean;
+  windowFrom: string; windowTo: string;
+};
 
-  // Satellite data only — there is no simulated fallback. If the Copernicus connection or the
-  // imagery is unavailable, the analysis fails with a clear message instead of inventing values.
+async function fetchSentinelHubData(coordinates: LatLng[], dateFrom: string, dateTo: string): Promise<SeriesPoint[]> {
+  // Satellite data only — there is no simulated fallback.
   const token = await getSentinelToken();
   if (!token) {
     throw new Error("Could not connect to the Copernicus satellite service. Check the Copernicus credentials (COPERNICUS_USER_ID / COPERNICUS_ACCOUNT_ID) and try again.");
   }
 
-  // Compute bounding box from polygon corners
-  const lats = coordinates.map(c => c.lat);
-  const lngs = coordinates.map(c => c.lng);
-  const bbox = [
-    Math.min(...lngs), Math.min(...lats),
-    Math.max(...lngs), Math.max(...lats)
-  ];
-
   const windows = biweeklyWindows(dateFrom, dateTo);
-  console.log(`Fetching ${windows.length} bi-weekly windows in parallel from Sentinel-2...`);
+  // Look FALLBACK_DAYS beyond the range so the first/last windows can also borrow a nearby image.
+  const today = new Date().toISOString().slice(0, 10);
+  const fetchTo = addDays(dateTo, FALLBACK_DAYS) > today ? today : addDays(dateTo, FALLBACK_DAYS);
+  const daily = await fetchDailyObservations(token, coordinates, addDays(dateFrom, -FALLBACK_DAYS), fetchTo);
+  const picks = selectImagesForWindows(windows, daily);
+  console.log(`Sentinel-2: ${daily.length} acquisitions found, ${daily.filter(d => d.cloudPct <= MAX_FIELD_CLOUD_PCT).length} with ≤${MAX_FIELD_CLOUD_PCT}% field cloud; ${picks.filter(p => p.obs).length}/${windows.length} windows filled`);
 
-  // Run all windows in parallel (much faster than sequential — avoids 503 timeouts)
-  const windowResults = await Promise.all(
-    windows.map(async (win) => {
-      let result = await fetchOneWindow(token, bbox, win.from, win.to, cloudCoverMax);
-      // If cloudy, retry with relaxed threshold (up to 50%)
-      if (result.noData && cloudCoverMax < 50) {
-        result = await fetchOneWindow(token, bbox, win.from, win.to, 50);
-      }
-      return { win, result };
-    })
-  );
-
-  // Each observation carries the window it came from and whether it is OPTRAM-eligible (real,
-  // non-water), so we can fetch its per-pixel raster and attach soil-moisture once the trapezoid
-  // edges are fit across every date's pooled pixels.
-  type Obs = { ndvi: number | null; ndwi: number | null; evi: number | null; soilMoisture: number | null; cloudCover: number; isWater: boolean; date: string; dataSource: string; excluded?: boolean; _win: { from: string; to: string } | null; _cloud: number };
-  const results: Obs[] = [];
-  let realDataCount = 0;
-
-  for (const { win, result } of windowResults) {
-    if (result.noData || result.ndvi === null) {
-      // No usable satellite image for this window (cloud cover or no overpass). Record the gap as an
-      // excluded observation with no values — nothing is estimated or simulated.
-      results.push({
-        date: win.mid, ndvi: null, ndwi: null, evi: null, soilMoisture: null,
-        cloudCover: 100, isWater: false, dataSource: "No clear image", excluded: true,
-        _win: null, _cloud: cloudCoverMax
-      });
-    } else {
-      realDataCount++;
-      const msiVal = result.msi ?? 0.8;
-      const { isWater } = classifyMsi(msiVal);
-      const source = result.cloudCover > cloudCoverMax ? "Sentinel-2 (relaxed cloud)" : "Sentinel-2";
-      results.push({
-        date: win.mid,
-        ndvi: result.ndvi,
-        ndwi: msiVal,
-        evi: result.evi ?? null,
-        soilMoisture: null,
-        cloudCover: result.cloudCover,
-        isWater,
-        dataSource: source,
-        // Water observations are excluded from soil-moisture, matching the rest of the pipeline.
-        _win: isWater ? null : { from: win.from, to: win.to },
-        _cloud: result.cloudCover > cloudCoverMax ? 50 : cloudCoverMax
-      });
+  const results: SeriesPoint[] = picks.map(({ window, obs, fallback }) => {
+    if (!obs) {
+      return {
+        date: window.mid, ndvi: null, ndwi: null, soilMoisture: null, cloudCover: null,
+        isWater: false, excluded: true, dataSource: `No image ≤${MAX_FIELD_CLOUD_PCT}% cloud`,
+        windowFrom: window.from, windowTo: window.to,
+      };
     }
+    return {
+      date: obs.date, ndvi: obs.ndvi, ndwi: obs.msi, soilMoisture: null, cloudCover: obs.cloudPct,
+      // A field that is mostly open water on this date is kept in the log but left out of stress analysis.
+      isWater: obs.waterPct >= 50,
+      dataSource: fallback ? `Sentinel-2 L2A (nearest image, outside window)` : "Sentinel-2 L2A",
+      windowFrom: window.from, windowTo: window.to,
+    };
+  });
+
+  if (!results.some(r => !r.excluded)) {
+    throw new Error(`No Sentinel-2 image with ${MAX_FIELD_CLOUD_PCT}% or less cloud over this field was found in the selected period. Try a longer date range.`);
   }
 
-  // No usable image in any window — fail the analysis rather than store an empty or invented series.
-  if (realDataCount === 0) {
-    throw new Error("No usable cloud-free Sentinel-2 images were found for this field and date range. Try a longer date range or a higher cloud-cover tolerance.");
-  }
-
-  // ── OPTRAM per-pixel calibration across all real dates in this analysis ──
-  // Fetch each eligible date's per-pixel raster (NDVI, STR) from the Process API, pool every valid
-  // pixel from every date, fit the dry/wet trapezoid edges on that pool, then compute a per-pixel W
-  // per date and average it. This replaces the previous aggregate-only approach that (mis)fit the
-  // edges on just ~5 per-date mean points.
-  const rasterByIndex = await Promise.all(
-    results.map(async (r) => (r._win ? fetchOptramRaster(token, bbox, r._win.from, r._win.to, r._cloud) : []))
+  // ── OPTRAM per-pixel calibration across all selected images ──
+  const rasters = await Promise.all(
+    results.map(r => (!r.excluded && !r.isWater ? fetchOptramRaster(token, coordinates, r.date) : Promise.resolve([] as PixelSample[])))
   );
   const pool: PixelSample[] = [];
-  for (const px of rasterByIndex) for (const p of px) pool.push(p);
-  console.log(`OPTRAM pooled ${pool.length} valid per-pixel (NDVI,STR) pairs across ${rasterByIndex.filter(p => p.length).length} dates`);
-
-  // fitOptramEdges logs the fitted edges + their STR range and rejects outlier-distorted fits.
+  for (const px of rasters) for (const p of px) pool.push(p);
+  console.log(`OPTRAM pooled ${pool.length} valid per-pixel (NDVI,STR) pairs across ${rasters.filter(p => p.length).length} dates`);
   const edges = fitOptramEdges(pool);
   if (edges) {
-    results.forEach((r, i) => {
-      r.soilMoisture = rasterByIndex[i].length ? optramDateMoisture(rasterByIndex[i], edges) : null;
-    });
+    results.forEach((r, i) => { r.soilMoisture = rasters[i].length ? optramDateMoisture(rasters[i], edges) : null; });
   } else {
     console.warn("OPTRAM: could not fit valid trapezoid edges — soil moisture unavailable");
   }
 
-  console.log(`Sentinel-2 fetch done: ${realDataCount}/${windows.length} windows with real data`);
-  // Strip internal calibration carriers before returning the stored/serialized series.
-  return results
-    .map(({ _win, _cloud, ...rest }) => rest)
-    .sort((a, b) => a.date.localeCompare(b.date));
+  return results.sort((a, b) => a.date.localeCompare(b.date));
 }
 
 // ─── Compute aggregated metrics from time-series data ──────────────────────
 function computeAggregates(timeSeriesData: any[]) {
   const valid = timeSeriesData.filter(d => !d.excluded && !d.isWater && d.ndvi !== null);
-  if (valid.length === 0) return { ndvi: null, ndwi: null, evi: null, healthScore: null };
+  if (valid.length === 0) return { ndvi: null, ndwi: null, healthScore: null };
   const latest = valid[valid.length - 1];
   const ndvi = latest.ndvi;
   const ndwi = latest.ndwi;
-  const evi = latest.evi ?? null;
-  // Health score: NDVI 70% + NDWI adequacy 30% (unchanged — EVI is supplementary/displayed only)
+  // Health score: NDVI 70% + MSI adequacy 30%
   const ndviScore = Math.max(0, ((ndvi - 0.05) / 0.9)) * 100;
   // MSI score: lower MSI = better moisture. Invert for health score.
   // MSI < 0.4 = excellent, 0.4-0.6 = good, 0.6-1.0 = ok, 1.0-1.2 = poor, >1.2 = critical
@@ -716,11 +604,11 @@ function computeAggregates(timeSeriesData: any[]) {
     ? (ndwi < 0.4 ? 95 : ndwi < 0.6 ? 80 : ndwi < 1.0 ? 60 : ndwi < 1.2 ? 35 : 10)
     : 50;
   const healthScore = Math.round(Math.max(0, Math.min(100, ndviScore * 0.7 + ndwiScore * 0.3)));
-  return { ndvi, ndwi, evi, healthScore };
+  return { ndvi, ndwi, healthScore };
 }
 
 // ─── Alert generation ──────────────────────────────────────────────────────
-function generateAlerts(fieldId: number, ndvi: number | null, ndwi: number | null, fieldName: string, evi?: number | null) {
+function generateAlerts(fieldId: number, ndvi: number | null, ndwi: number | null, fieldName: string) {
   const now = new Date().toISOString();
   const list: any[] = [];
   if (ndvi === null) return list;
@@ -740,10 +628,6 @@ function generateAlerts(fieldId: number, ndvi: number | null, ndwi: number | nul
       list.push({ fieldId, type: "water_stress", severity: "warning", createdAt: now,
         message: `${fieldName}: Moderate water stress detected (MSI ${ndwi.toFixed(3)}). Consider supplemental irrigation.` });
     }
-  }
-  if (typeof evi === "number" && evi < 0.1) {
-    list.push({ fieldId, type: "evi_critical", severity: "warning", createdAt: now,
-      message: `${fieldName}: EVI critically low (${evi.toFixed(3)}), corroborating weak canopy vigor.` });
   }
   if (ndvi > 0.7 && ndwi !== null && ndwi < 0.6) {
     list.push({ fieldId, type: "optimal", severity: "info", createdAt: now,
@@ -788,33 +672,32 @@ setInterval(sweepAnalyzeJobs, 10 * 60 * 1000).unref?.();
 // Returns the exact shape the old synchronous endpoint used to return.
 async function runFieldAnalysis(
   fieldId: number,
-  opts: { dateFrom: string; dateTo: string; cloudCoverMax: number },
+  opts: { dateFrom: string; dateTo: string },
 ) {
   const field = storage.getField(fieldId);
   if (!field) throw new Error("Field not found");
 
-  const { dateFrom, dateTo, cloudCoverMax } = opts;
+  const { dateFrom, dateTo } = opts;
   const coords = JSON.parse(field.coordinates);
-  const timeSeriesData = await fetchSentinelHubData(coords, dateFrom, dateTo, cloudCoverMax);
-  const { ndvi, ndwi, evi, healthScore } = computeAggregates(timeSeriesData);
+  const timeSeriesData = await fetchSentinelHubData(coords, dateFrom, dateTo);
+  const { ndvi, ndwi, healthScore } = computeAggregates(timeSeriesData);
 
   const updated = storage.updateField(field.id, {
     ndvi: ndvi ?? undefined,
     ndwi: ndwi ?? undefined,
-    evi: evi ?? undefined,
     healthScore: healthScore ?? undefined,
     status: healthScore !== null ? (healthScore < 45 ? "alert" : "analyzed") : "analyzed", // Health score bands: >=70 Healthy, 45-69 Monitor, <45 Alert
     timeSeriesData: JSON.stringify(timeSeriesData),
     dateFrom,
     dateTo,
-    cloudCoverMax,
+    cloudCoverMax: MAX_FIELD_CLOUD_PCT,
     analyzedAt: new Date().toISOString(),
   });
 
   // Generate alerts (only if bi-weekly is due)
   const notifyDue = isBiweeklyDue(field.lastNotifiedAt ?? null);
   storage.deleteAlertsByField(field.id);
-  const newAlerts = generateAlerts(field.id, ndvi, ndwi, field.name, evi);
+  const newAlerts = generateAlerts(field.id, ndvi, ndwi, field.name);
   newAlerts.forEach(a => storage.createAlert(a));
 
   if (notifyDue) {
@@ -868,7 +751,6 @@ export function registerRoutes(httpServer: Server, app: Express) {
     const {
       dateFrom = field.dateFrom || new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString().split("T")[0],
       dateTo = field.dateTo || new Date().toISOString().split("T")[0],
-      cloudCoverMax = field.cloudCoverMax ?? 20
     } = req.body || {};
 
     const jobId = randomUUID();
@@ -876,7 +758,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
     // Fire-and-forget: run the analysis outside the request lifecycle. Any rejection is
     // captured as a job error so it never becomes an unhandled rejection / process crash.
-    runFieldAnalysis(field.id, { dateFrom, dateTo, cloudCoverMax })
+    runFieldAnalysis(field.id, { dateFrom, dateTo })
       .then(result => {
         analyzeJobs.set(jobId, { status: "done", createdAt: Date.now(), result });
       })
@@ -944,15 +826,22 @@ export function registerRoutes(httpServer: Server, app: Express) {
         const coords = JSON.parse(field.coordinates);
         const dateFrom = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
         const dateTo = new Date().toISOString().split("T")[0];
-        const ts = await fetchSentinelHubData(coords, dateFrom, dateTo, field.cloudCoverMax ?? 20);
-        const { ndvi, ndwi, evi, healthScore } = computeAggregates(ts);
+        const fresh = await fetchSentinelHubData(coords, dateFrom, dateTo);
+        // Add the new observation to the field's existing history instead of replacing it.
+        const previous: any[] = field.timeSeriesData ? JSON.parse(field.timeSeriesData) : [];
+        const freshDates = new Set(fresh.map(p => p.date));
+        const ts = [...previous.filter(p => !freshDates.has(p.date) && !(p.excluded && p.date >= dateFrom)), ...fresh]
+          .sort((a, b) => a.date.localeCompare(b.date));
+        const { ndvi, ndwi, healthScore } = computeAggregates(ts);
         storage.deleteAlertsByField(field.id);
-        generateAlerts(field.id, ndvi, ndwi, field.name, evi).forEach(a => storage.createAlert(a));
+        generateAlerts(field.id, ndvi, ndwi, field.name).forEach(a => storage.createAlert(a));
         storage.updateField(field.id, {
-          ndvi: ndvi ?? undefined, ndwi: ndwi ?? undefined, evi: evi ?? undefined, healthScore: healthScore ?? undefined,
-          timeSeriesData: JSON.stringify(ts), lastNotifiedAt: new Date().toISOString()
+          ndvi: ndvi ?? undefined, ndwi: ndwi ?? undefined, healthScore: healthScore ?? undefined,
+          status: healthScore !== null ? (healthScore < 45 ? "alert" : "analyzed") : "analyzed",
+          timeSeriesData: JSON.stringify(ts), dateTo, cloudCoverMax: MAX_FIELD_CLOUD_PCT,
+          analyzedAt: new Date().toISOString(), lastNotifiedAt: new Date().toISOString()
         });
-        results.push({ fieldId: field.id, name: field.name, ndvi, ndwi, evi });
+        results.push({ fieldId: field.id, name: field.name, ndvi, ndwi });
       } catch (err: any) {
         // No satellite data for this field this cycle — keep its previous results and report why.
         results.push({ fieldId: field.id, name: field.name, error: String(err?.message || err) });
@@ -971,8 +860,16 @@ export function registerRoutes(httpServer: Server, app: Express) {
     res.json({ success: true });
   });
 
-  // ─── Spatial map: render NDVI or MSI PNG for a field + date window ────────────
-  // Returns a 256x256 false-colour PNG from Sentinel Hub Process API
+  // Maps and stress zones may only use images that passed the ≤20% field-cloud rule, i.e. dates
+  // that appear as valid observations in the field's stored time series.
+  function qualifyingDate(field: { timeSeriesData: string | null }, date: string): boolean {
+    const ts: any[] = field.timeSeriesData ? JSON.parse(field.timeSeriesData) : [];
+    return ts.some(d => d.date === date && !d.excluded && d.ndvi !== null);
+  }
+  const NOT_QUALIFYING = `This date is not one of the field's qualifying images (${MAX_FIELD_CLOUD_PCT}% or less cloud over the field). Re-run the analysis and choose a date from the time series.`;
+  const SCL_MASK_JS = `[${SCL_CLOUD_CLASSES.join(",")}].indexOf(s.SCL)>=0||s.SCL===0||s.SCL===1||s.dataMask===0`;
+
+  // ─── Spatial map: render NDVI or MSI PNG for a field on one qualifying image date ──
   app.get("/api/fields/:id/map", requireAuth, async (req, res) => {
     try {
       const field = storage.getField(Number(req.params.id));
@@ -980,76 +877,47 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
       const { date, type = "ndvi" } = req.query as { date?: string; type?: string };
       if (!date) return res.status(400).json({ error: "date query param required (YYYY-MM-DD)" });
-
-      // Window: day-3 to day+3 around the requested date (finds nearest overpass)
-      const d = new Date(date);
-      const winFrom = new Date(d); winFrom.setDate(d.getDate() - 3);
-      const winTo   = new Date(d); winTo.setDate(d.getDate() + 3);
-      const fromStr = winFrom.toISOString().split("T")[0];
-      const toStr   = winTo.toISOString().split("T")[0];
+      if (type !== "ndvi" && type !== "msi") return res.status(400).json({ error: "type must be ndvi or msi" });
+      if (!qualifyingDate(field, date)) return res.status(400).json({ error: NOT_QUALIFYING });
 
       const coords = JSON.parse(field.coordinates) as { lat: number; lng: number }[];
-      const lats = coords.map(c => c.lat);
-      const lngs = coords.map(c => c.lng);
-      // Add a small buffer (~500m) so the field isn’t clipped at the edge
-      const buf = 0.005;
-      const bbox = [
-        Math.min(...lngs) - buf, Math.min(...lats) - buf,
-        Math.max(...lngs) + buf, Math.max(...lats) + buf
-      ];
+      // Small buffer (~500m) so the field isn't clipped at the edge
+      const bbox = bboxOf(coords, 0.005);
 
       const token = await getSentinelToken();
       if (!token) {
         return res.status(503).json({ error: "No Sentinel Hub token — check credentials" });
       }
 
-      // Choose evalscript based on requested index
-      // NDVI: green → yellow → red colour ramp
-      // MSI:  blue (moist) → yellow → red (stressed) ramp (inverted because MSI increases with stress)
-      // EVI:  purple/red (low) → yellow → green (high) — distinct ramp from NDVI
+      // NDVI: red → yellow → green ramp.  MSI: blue (moist) → yellow → red (stressed).
+      // Cloud, cirrus, cloud shadow and no-data pixels → grey; water → blue.
       let evalscript: string;
       if (type === "ndvi") {
         evalscript = [
             "//VERSION=3",
-            "function setup(){return{input:[{bands:['B04','B08','SCL']}],output:{bands:3}};}",
+            "function setup(){return{input:[{bands:['B04','B08','SCL','dataMask']}],output:{bands:3}};}",
             "function evaluatePixel(s){",
-            "  if([8,9,10].includes(s.SCL))return[0.6,0.6,0.7];" ,  // cloud → grey
-            "  if(s.SCL===6)return[0.1,0.3,0.7];",                  // water → blue
+            `  if(${SCL_MASK_JS})return[0.6,0.6,0.7];`,
+            `  if(s.SCL===${SCL_WATER_CLASS})return[0.1,0.3,0.7];`,
             "  var n=(s.B08-s.B04)/(s.B08+s.B04+0.0001);",
             "  var v=Math.max(0,Math.min(1,(n+0.2)/1.0));",
-            "  if(v<0.33)return[0.8+v*0.6, v*1.2, 0.05];",          // red-orange (low NDVI)
-            "  if(v<0.66)return[0.8-v*0.4, 0.7+v*0.3, 0.05];",     // yellow (moderate)
-            "  return[0.05, 0.4+v*0.5, 0.1];",                       // green (high NDVI)
-            "}"
-          ].join("\n");
-      } else if (type === "evi") {
-        evalscript = [
-            "//VERSION=3",
-            "function setup(){return{input:[{bands:['B02','B04','B08','SCL']}],output:{bands:3}};}",
-            "function evaluatePixel(s){",
-            "  if([8,9,10].includes(s.SCL))return[0.6,0.6,0.7];",   // cloud → grey
-            "  if(s.SCL===6)return[0.1,0.3,0.7];",                   // water → blue
-            "  var n=s.B08, r=s.B04, b=s.B02;",
-            "  var den=n+6*r-7.5*b+1;",
-            "  var evi=Math.abs(den)<0.01?0:2.5*(n-r)/den;",
-            "  var v=Math.max(0,Math.min(1,(evi+0.2)/0.9));",
-            "  if(v<0.33)return[0.55+v*0.3, 0.05, 0.55-v*0.3];",    // purple-magenta (low EVI)
-            "  if(v<0.66)return[0.85-v*0.3, 0.75+v*0.2, 0.05];",    // yellow-orange (moderate)
-            "  return[0.05, 0.35+v*0.55, 0.15];",                    // green (high EVI)
+            "  if(v<0.33)return[0.8+v*0.6, v*1.2, 0.05];",
+            "  if(v<0.66)return[0.8-v*0.4, 0.7+v*0.3, 0.05];",
+            "  return[0.05, 0.4+v*0.5, 0.1];",
             "}"
           ].join("\n");
       } else {
         evalscript = [
             "//VERSION=3",
-            "function setup(){return{input:[{bands:['B8A','B11','SCL']}],output:{bands:3}};}",
+            "function setup(){return{input:[{bands:['B8A','B11','SCL','dataMask']}],output:{bands:3}};}",
             "function evaluatePixel(s){",
-            "  if([8,9,10].includes(s.SCL))return[0.6,0.6,0.7];",   // cloud → grey
-            "  if(s.SCL===6)return[0.1,0.3,0.7];",                   // water → blue
+            `  if(${SCL_MASK_JS})return[0.6,0.6,0.7];`,
+            `  if(s.SCL===${SCL_WATER_CLASS})return[0.1,0.3,0.7];`,
             "  var msi=(s.B11/(s.B8A+0.001));",
-            "  var v=Math.max(0,Math.min(1,(msi-0.1)/1.5));",       // 0=moist, 1=stressed
-            "  if(v<0.33)return[0.05,0.5,0.85];",                    // blue (moist)
-            "  if(v<0.66)return[0.95,0.85,0.1];",                    // yellow (moderate)
-            "  return[0.9,0.1,0.05];",                               // red (stressed)
+            "  var v=Math.max(0,Math.min(1,(msi-0.1)/1.5));",
+            "  if(v<0.33)return[0.05,0.5,0.85];",
+            "  if(v<0.66)return[0.95,0.85,0.1];",
+            "  return[0.9,0.1,0.05];",
             "}"
           ].join("\n");
       }
@@ -1059,11 +927,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
           bounds: { bbox, properties: { crs: "http://www.opengis.net/def/crs/EPSG/0/4326" } },
           data: [{
             type: "sentinel-2-l2a",
-            dataFilter: {
-              timeRange: { from: `${fromStr}T00:00:00Z`, to: `${toStr}T23:59:59Z` },
-              maxCloudCoverage: 80,
-              mosaickingOrder: "leastCC"
-            }
+            dataFilter: { timeRange: { from: `${date}T00:00:00Z`, to: `${date}T23:59:59Z` } }
           }]
         },
         output: { width: 256, height: 256, responses: [{ identifier: "default", format: { type: "image/png" } }] },
@@ -1238,13 +1102,9 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
       const { date, index = "ndvi", maxZones = "5" } = req.query as { date?: string; index?: string; maxZones?: string };
       if (!date) return res.status(400).json({ error: "date query param required (YYYY-MM-DD)" });
+      if (index !== "ndvi" && index !== "msi") return res.status(400).json({ error: "index must be ndvi or msi" });
+      if (!qualifyingDate(field, date)) return res.status(400).json({ error: NOT_QUALIFYING });
       const limit = Math.max(1, Math.min(10, parseInt(maxZones) || 5));
-
-      const d = new Date(date);
-      const winFrom = new Date(d); winFrom.setDate(d.getDate() - 3);
-      const winTo = new Date(d); winTo.setDate(d.getDate() + 3);
-      const fromStr = winFrom.toISOString().split("T")[0];
-      const toStr = winTo.toISOString().split("T")[0];
 
       const coords = JSON.parse(field.coordinates) as { lat: number; lng: number }[];
       const lats = coords.map(c => c.lat);
@@ -1262,49 +1122,33 @@ export function registerRoutes(httpServer: Server, app: Express) {
       const GRID = 40; // 40x40 grid — fine enough for sub-field zones, coarse enough to be fast
 
       // Evalscript encodes the raw index value directly as an 8-bit grayscale value.
-      // Cloud/water pixels are encoded as a reserved sentinel (255) so we can exclude them.
+      // Cloud, cirrus, cloud shadow, no-data and water pixels are encoded as 255 and excluded.
       let evalscript: string;
-      let isStressHigh: boolean; // true = higher raw value means MORE stress (e.g. MSI)
+      let isStressHigh: boolean; // true = higher raw value means MORE stress (MSI)
       if (index === "msi") {
         isStressHigh = true;
         evalscript = [
           "//VERSION=3",
-          "function setup(){return{input:[{bands:['B8A','B11','SCL']}],output:{bands:1,sampleType:'UINT8'}};}",
+          "function setup(){return{input:[{bands:['B8A','B11','SCL','dataMask']}],output:{bands:1,sampleType:'UINT8'}};}",
           "function evaluatePixel(s){",
-          "  if([8,9,10].includes(s.SCL)||s.SCL===6)return[255];", // cloud or water → sentinel
+          `  if(${SCL_MASK_JS}||s.SCL===${SCL_WATER_CLASS})return[255];`,
           "  var msi=(s.B11/(s.B8A+0.001));",
           "  var v=Math.max(0,Math.min(1,(msi-0.1)/1.5));",
-          "  return[Math.round(v*254)];", // 0-254 range, 255 reserved for excluded
+          "  return[Math.round(v*254)];",
           "}"
         ].join("\n");
       } else {
-        isStressHigh = false; // low NDVI/EVI = more stress
-        const band = index === "evi" ? "evi" : "ndvi";
-        if (band === "evi") {
-          evalscript = [
-            "//VERSION=3",
-            "function setup(){return{input:[{bands:['B02','B04','B08','SCL']}],output:{bands:1,sampleType:'UINT8'}};}",
-            "function evaluatePixel(s){",
-            "  if([8,9,10].includes(s.SCL)||s.SCL===6)return[255];",
-            "  var n=s.B08,r=s.B04,b=s.B02;",
-            "  var den=n+6*r-7.5*b+1;",
-            "  var evi=Math.abs(den)<0.01?0:2.5*(n-r)/den;",
-            "  var v=Math.max(0,Math.min(1,(evi+0.2)/0.9));",
-            "  return[Math.round(v*254)];",
-            "}"
-          ].join("\n");
-        } else {
-          evalscript = [
-            "//VERSION=3",
-            "function setup(){return{input:[{bands:['B04','B08','SCL']}],output:{bands:1,sampleType:'UINT8'}};}",
-            "function evaluatePixel(s){",
-            "  if([8,9,10].includes(s.SCL)||s.SCL===6)return[255];",
-            "  var n=(s.B08-s.B04)/(s.B08+s.B04+0.0001);",
-            "  var v=Math.max(0,Math.min(1,(n+0.2)/1.0));",
-            "  return[Math.round(v*254)];",
-            "}"
-          ].join("\n");
-        }
+        isStressHigh = false; // low NDVI = more stress
+        evalscript = [
+          "//VERSION=3",
+          "function setup(){return{input:[{bands:['B04','B08','SCL','dataMask']}],output:{bands:1,sampleType:'UINT8'}};}",
+          "function evaluatePixel(s){",
+          `  if(${SCL_MASK_JS}||s.SCL===${SCL_WATER_CLASS})return[255];`,
+          "  var n=(s.B08-s.B04)/(s.B08+s.B04+0.0001);",
+          "  var v=Math.max(0,Math.min(1,(n+0.2)/1.0));",
+          "  return[Math.round(v*254)];",
+          "}"
+        ].join("\n");
       }
 
       const body = {
@@ -1313,9 +1157,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
           data: [{
             type: "sentinel-2-l2a",
             dataFilter: {
-              timeRange: { from: `${fromStr}T00:00:00Z`, to: `${toStr}T23:59:59Z` },
-              maxCloudCoverage: 80,
-              mosaickingOrder: "leastCC"
+              timeRange: { from: `${date}T00:00:00Z`, to: `${date}T23:59:59Z` }
             }
           }]
         },
