@@ -60,7 +60,7 @@ async function getSentinelToken(): Promise<string> {
     if (!res.ok) {
       const errText = await res.text();
       console.warn("OAuth2 token error:", res.status, errText);
-      // Credentials not yet configured — fall through to simulation
+      // Credentials not configured or rejected — caller reports the failure (no simulated fallback)
       return "";
     }
     const json = await res.json();
@@ -68,7 +68,7 @@ async function getSentinelToken(): Promise<string> {
     _tokenExpiry = Date.now() + (json.expires_in || 600) * 1000;
     return _cachedToken || "";
   } catch (err) {
-    console.warn("OAuth2 token fetch failed (falling back to simulation):", err);
+    console.warn("OAuth2 token fetch failed:", err);
     return "";
   }
 }
@@ -597,12 +597,13 @@ async function fetchSentinelHubData(
   dateFrom: string,
   dateTo: string,
   cloudCoverMax: number
-): Promise<{ ndvi: number; ndwi: number; evi: number | null; soilMoisture: number | null; cloudCover: number; isWater: boolean; date: string; dataSource: string }[]> {
+): Promise<{ ndvi: number | null; ndwi: number | null; evi: number | null; soilMoisture: number | null; cloudCover: number; isWater: boolean; date: string; dataSource: string; excluded?: boolean }[]> {
 
+  // Satellite data only — there is no simulated fallback. If the Copernicus connection or the
+  // imagery is unavailable, the analysis fails with a clear message instead of inventing values.
   const token = await getSentinelToken();
   if (!token) {
-    console.log("No Sentinel token — using simulation");
-    return simulateTimeSeries(coordinates, dateFrom, dateTo);
+    throw new Error("Could not connect to the Copernicus satellite service. Check the Copernicus credentials (COPERNICUS_USER_ID / COPERNICUS_ACCOUNT_ID) and try again.");
   }
 
   // Compute bounding box from polygon corners
@@ -631,18 +632,19 @@ async function fetchSentinelHubData(
   // Each observation carries the window it came from and whether it is OPTRAM-eligible (real,
   // non-water), so we can fetch its per-pixel raster and attach soil-moisture once the trapezoid
   // edges are fit across every date's pooled pixels.
-  type Obs = { ndvi: number; ndwi: number; evi: number | null; soilMoisture: number | null; cloudCover: number; isWater: boolean; date: string; dataSource: string; _win: { from: string; to: string } | null; _cloud: number };
+  type Obs = { ndvi: number | null; ndwi: number | null; evi: number | null; soilMoisture: number | null; cloudCover: number; isWater: boolean; date: string; dataSource: string; excluded?: boolean; _win: { from: string; to: string } | null; _cloud: number };
   const results: Obs[] = [];
   let realDataCount = 0;
 
   for (const { win, result } of windowResults) {
     if (result.noData || result.ndvi === null) {
-      // No usable data for this window — fill with a simulation estimate.
-      // Soil moisture is left null (no real pixels) rather than fabricated for gap-filled dates.
-      const simPts = simulateTimeSeries(coordinates, win.mid, win.mid);
-      if (simPts.length > 0) {
-        results.push({ ...simPts[0], date: win.mid, dataSource: "Estimated (cloud gap)", soilMoisture: null, _win: null, _cloud: cloudCoverMax });
-      }
+      // No usable satellite image for this window (cloud cover or no overpass). Record the gap as an
+      // excluded observation with no values — nothing is estimated or simulated.
+      results.push({
+        date: win.mid, ndvi: null, ndwi: null, evi: null, soilMoisture: null,
+        cloudCover: 100, isWater: false, dataSource: "No clear image", excluded: true,
+        _win: null, _cloud: cloudCoverMax
+      });
     } else {
       realDataCount++;
       const msiVal = result.msi ?? 0.8;
@@ -664,10 +666,9 @@ async function fetchSentinelHubData(
     }
   }
 
-  // If we got zero real results, fall back to full simulation
+  // No usable image in any window — fail the analysis rather than store an empty or invented series.
   if (realDataCount === 0) {
-    console.warn("Zero real Sentinel-2 results — falling back to simulation");
-    return simulateTimeSeries(coordinates, dateFrom, dateTo).map((d: any) => ({ ...d, soilMoisture: null }));
+    throw new Error("No usable cloud-free Sentinel-2 images were found for this field and date range. Try a longer date range or a higher cloud-cover tolerance.");
   }
 
   // ── OPTRAM per-pixel calibration across all real dates in this analysis ──
@@ -697,76 +698,6 @@ async function fetchSentinelHubData(
   return results
     .map(({ _win, _cloud, ...rest }) => rest)
     .sort((a, b) => a.date.localeCompare(b.date));
-}
-
-// ─── Bi-weekly simulation: one obs every ~14 days between dateFrom/dateTo ──
-function simulateTimeSeries(
-  coordinates: { lat: number; lng: number }[],
-  dateFrom: string,
-  dateTo: string
-) {
-  const centLat = coordinates.reduce((s, c) => s + c.lat, 0) / coordinates.length;
-  const centLng = coordinates.reduce((s, c) => s + c.lng, 0) / coordinates.length;
-  const seed = Math.abs(Math.sin(centLat * 127.3 + centLng * 311.7));
-  const seed2 = Math.abs(Math.sin(centLat * 53.1 + centLng * 97.4));
-
-  const start = new Date(dateFrom);
-  const end = new Date(dateTo);
-  const results: any[] = [];
-  const current = new Date(start);
-
-  while (current <= end) {
-    const t = (current.getTime() - start.getTime()) / (end.getTime() - start.getTime() + 1);
-    // Seasonal NDVI variation (Ghana has two rainy seasons ~Mar-Jun, Sep-Nov)
-    const month = current.getMonth(); // 0-11
-    const seasonalBoost = (month >= 3 && month <= 5) || (month >= 8 && month <= 10) ? 0.12 : -0.06;
-    const rngNdvi = Math.abs(Math.sin(seed * (t * 100 + 1) * 7.3));
-    const rngNdwi = Math.abs(Math.sin(seed2 * (t * 100 + 2) * 5.1));
-    const baseNdvi = 0.2 + seed * 0.5;
-    // MSI base: lower in wet season (0.3–0.6), higher in dry (0.8–1.4)
-    const baseMsi = 0.5 + seed2 * 0.6;
-    const ndvi = Math.max(0.05, Math.min(0.95, baseNdvi + seasonalBoost + (rngNdvi - 0.5) * 0.1));
-    // In wet season MSI drops (more moisture = lower MSI)
-    const seasonalMsiDrop = (month >= 3 && month <= 5) || (month >= 8 && month <= 10) ? -0.15 : 0.1;
-    const rawNdwi = Math.max(0.1, Math.min(2.0, baseMsi + seasonalMsiDrop + (rngNdwi - 0.5) * 0.2));
-    // Exclude open water pixels — MSI < 0.1 indicates open water
-    const isWater = rawNdwi < 0.1;
-    const cloudCover = Math.round(Math.abs(Math.sin(seed * t * 13.7)) * 30);
-    // If cloud cover > threshold, mark as cloud-contaminated
-    const cloudOk = cloudCover <= 20;
-
-    // EVI correlates with NDVI but has reduced saturation over dense canopy —
-    // approximate as a damped, slightly noisy function of NDVI for simulation.
-    const rngEvi = Math.abs(Math.sin(seed * (t * 100 + 3) * 9.1));
-    const rawEvi = Math.max(-1, Math.min(1, ndvi * 0.85 + (rngEvi - 0.5) * 0.08));
-
-    if (!isWater && cloudOk) {
-      results.push({
-        date: current.toISOString().split("T")[0],
-        ndvi: Math.round(ndvi * 1000) / 1000,
-        ndwi: Math.round(rawNdwi * 1000) / 1000,
-        evi: Math.round(rawEvi * 1000) / 1000,
-        cloudCover,
-        isWater: false,
-        dataSource: "Simulated (no API key)"
-      });
-    } else if (!cloudOk) {
-      // Record cloudy observation — flagged, values estimated
-      results.push({
-        date: current.toISOString().split("T")[0],
-        ndvi: null,
-        ndwi: null,
-        evi: null,
-        cloudCover,
-        isWater: false,
-        dataSource: "Cloudy — excluded",
-        excluded: true
-      });
-    }
-    // Advance ~14 days (bi-weekly Sentinel-2 pass)
-    current.setDate(current.getDate() + 14);
-  }
-  return results;
 }
 
 // ─── Compute aggregated metrics from time-series data ──────────────────────
@@ -872,7 +803,7 @@ async function runFieldAnalysis(
     ndwi: ndwi ?? undefined,
     evi: evi ?? undefined,
     healthScore: healthScore ?? undefined,
-    status: healthScore !== null ? (healthScore < 40 ? "alert" : "analyzed") : "analyzed",
+    status: healthScore !== null ? (healthScore < 45 ? "alert" : "analyzed") : "analyzed", // Health score bands: >=70 Healthy, 45-69 Monitor, <45 Alert
     timeSeriesData: JSON.stringify(timeSeriesData),
     dateFrom,
     dateTo,
@@ -898,10 +829,10 @@ export function registerRoutes(httpServer: Server, app: Express) {
   // Keep-alive ping — no auth, just confirms server is up
   app.get("/api/ping", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
-  // Settings: read/write Sentinel Hub token
-  app.get("/api/settings/sentinel-status", (_req, res) => {
-    // Credentials are always present (Copernicus OAuth2 wired in)
-    res.json({ connected: true, tokenHint: "••••••••", mode: "Copernicus SentinelHub API" });
+  // Satellite connection status: actually attempts (or reuses a cached) Copernicus OAuth2 token
+  app.get("/api/settings/sentinel-status", async (_req, res) => {
+    const token = await getSentinelToken();
+    res.json({ connected: !!token, mode: "Copernicus SentinelHub API" });
   });
 
   // Get all fields
@@ -1009,18 +940,23 @@ export function registerRoutes(httpServer: Server, app: Express) {
     );
     const results = [];
     for (const field of due) {
-      const coords = JSON.parse(field.coordinates);
-      const dateFrom = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-      const dateTo = new Date().toISOString().split("T")[0];
-      const ts = await fetchSentinelHubData(coords, dateFrom, dateTo, field.cloudCoverMax ?? 20);
-      const { ndvi, ndwi, evi, healthScore } = computeAggregates(ts);
-      storage.deleteAlertsByField(field.id);
-      generateAlerts(field.id, ndvi, ndwi, field.name, evi).forEach(a => storage.createAlert(a));
-      storage.updateField(field.id, {
-        ndvi: ndvi ?? undefined, ndwi: ndwi ?? undefined, evi: evi ?? undefined, healthScore: healthScore ?? undefined,
-        timeSeriesData: JSON.stringify(ts), lastNotifiedAt: new Date().toISOString()
-      });
-      results.push({ fieldId: field.id, name: field.name, ndvi, ndwi, evi });
+      try {
+        const coords = JSON.parse(field.coordinates);
+        const dateFrom = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+        const dateTo = new Date().toISOString().split("T")[0];
+        const ts = await fetchSentinelHubData(coords, dateFrom, dateTo, field.cloudCoverMax ?? 20);
+        const { ndvi, ndwi, evi, healthScore } = computeAggregates(ts);
+        storage.deleteAlertsByField(field.id);
+        generateAlerts(field.id, ndvi, ndwi, field.name, evi).forEach(a => storage.createAlert(a));
+        storage.updateField(field.id, {
+          ndvi: ndvi ?? undefined, ndwi: ndwi ?? undefined, evi: evi ?? undefined, healthScore: healthScore ?? undefined,
+          timeSeriesData: JSON.stringify(ts), lastNotifiedAt: new Date().toISOString()
+        });
+        results.push({ fieldId: field.id, name: field.name, ndvi, ndwi, evi });
+      } catch (err: any) {
+        // No satellite data for this field this cycle — keep its previous results and report why.
+        results.push({ fieldId: field.id, name: field.name, error: String(err?.message || err) });
+      }
     }
     res.json({ checked: due.length, results });
   });

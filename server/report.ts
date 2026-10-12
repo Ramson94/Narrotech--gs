@@ -473,7 +473,7 @@ export function generateFieldReport(
     "EVI = 2.5 × (B08 − B04) / (B08 + 6×B04 − 7.5×B02 + 1) · Enhanced Vegetation Index; reduces soil/atmospheric background noise vs NDVI",
     "Observation cadence: bi-weekly (best cloud-free pass within each 14-day window)",
     `Cloud filter: scenes with > ${field.cloudCoverMax ?? 20}% cloud cover excluded; fallback to least-cloudy available`,
-    "Health Score: composite of NDVI, MSI, and trend direction (0–100 scale)",
+    "Health Score (0–100): NDVI score × 0.7 + MSI score × 0.3 · 70+ Healthy, 45-69 Monitor, below 45 Alert",
   ];
 
   doc.fontSize(8).fillColor(C.mid).font("Helvetica");

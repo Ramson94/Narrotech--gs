@@ -98,7 +98,7 @@ export function buildWhatsAppMessage(field: Field, alerts: Alert[]): string {
   lines.push("");
   lines.push("—");
   lines.push("_NarrowTech GeoSolution_");
-  lines.push("_narrowtechgeosolution.com_");
+  lines.push("_narrowtechgeosolution.org_");
 
   return lines.join("\n");
 }
