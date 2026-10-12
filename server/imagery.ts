@@ -25,6 +25,8 @@ export type DailyObservation = {
   waterPct: number;         // % of field pixels classed as water
   ndvi: number | null;      // mean over clear land pixels only
   msi: number | null;       // mean over clear land pixels only
+  // Optional split of cloudPct, for explaining rejected images (% of field pixels).
+  breakdown?: { opaque: number; cirrus: number; shadow: number; noData: number };
 };
 
 export type SelectedObservation = {
