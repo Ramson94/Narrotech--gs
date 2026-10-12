@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { shapeBBox, shapeFromField, type FieldShape } from "@shared/geometry";
 import { useQuery } from "@tanstack/react-query";
 import { apiRequest } from "@/lib/queryClient";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -56,77 +57,50 @@ function MsiLegend() {
 }
 
 // ── Project lat/lng polygon onto 0..1 image space given a bbox ──────────────
-const BUF = 0.005; // must match server-side buffer
-function projectPolygon(
-  coords: { lat: number; lng: number }[],
-  size: number = 100 // SVG viewBox size
-): string {
-  const lngs = coords.map(c => c.lng);
-  const lats = coords.map(c => c.lat);
-  const minLng = Math.min(...lngs) - BUF;
-  const maxLng = Math.max(...lngs) + BUF;
-  const minLat = Math.min(...lats) - BUF;
-  const maxLat = Math.max(...lats) + BUF;
-  const spanLng = maxLng - minLng;
-  const spanLat = maxLat - minLat;
-  return coords
-    .map(({ lat, lng }) => {
-      const x = ((lng - minLng) / spanLng) * size;
-      // latitude: top of image = maxLat, so invert
-      const y = ((maxLat - lat) / spanLat) * size;
-      return `${x.toFixed(2)},${y.toFixed(2)}`;
-    })
-    .join(" ");
+const BUF = 0.005; // must match server-side buffer (bboxOf(shape, 0.005))
+
+// Project every ring of the field (all plots and holes) into image space and return one SVG path.
+// With fill-rule "evenodd", holes stay empty.
+function projectShape(shape: FieldShape, size: number = 100): string {
+  const [minLng, minLat, maxLng, maxLat] = shapeBBox(shape, BUF);
+  return shape.flatMap(plot => plot).map(ring =>
+    "M" + ring.map(([lng, lat]) =>
+      `${(((lng - minLng) / (maxLng - minLng)) * size).toFixed(2)},${(((maxLat - lat) / (maxLat - minLat)) * size).toFixed(2)}`
+    ).join(" L") + " Z"
+  ).join(" ");
 }
 
 // ── Clipped image with SVG polygon mask ───────────────────────────────────
 function ClippedMapImage({
   imgUrl,
-  coords,
+  shape,
   label,
   onClick,
 }: {
   imgUrl: string;
-  coords: { lat: number; lng: number }[];
+  shape: FieldShape;
   label: string;
   onClick: () => void;
 }) {
-  const clipId = `clip-${label.replace(/\W/g, "-")}`;
-  const points = projectPolygon(coords);
+  const path = projectShape(shape);
 
   return (
     <div
       className="relative aspect-square w-full rounded-lg overflow-hidden border border-border bg-black cursor-zoom-in"
       onClick={onClick}
+      aria-label={label}
     >
-      {/* Full satellite image as background */}
-      <img
-        src={imgUrl}
-        alt={label}
-        className="absolute inset-0 w-full h-full object-cover opacity-20"
-        aria-hidden
-      />
-      {/* SVG clipped version on top */}
+      {/* The server returns the map already clipped to the field: transparent outside it. */}
       <svg
         viewBox="0 0 100 100"
         className="absolute inset-0 w-full h-full"
         preserveAspectRatio="none"
       >
-        <defs>
-          <clipPath id={clipId}>
-            <polygon points={points} />
-          </clipPath>
-        </defs>
-        {/* Satellite image clipped to field polygon */}
-        <image
-          href={imgUrl}
-          x="0" y="0" width="100" height="100"
-          clipPath={`url(#${clipId})`}
-          preserveAspectRatio="none"
-        />
-        {/* Field outline */}
-        <polygon
-          points={points}
+        <image href={imgUrl} x="0" y="0" width="100" height="100" preserveAspectRatio="none" />
+        {/* Field outline: every plot and hole */}
+        <path
+          d={path}
+          fillRule="evenodd"
           fill="none"
           stroke="white"
           strokeWidth="0.8"
@@ -148,7 +122,7 @@ async function downloadMapPng(
   fieldName: string,
   date: string,
   type: string,
-  coords: { lat: number; lng: number }[],
+  shape: FieldShape,
   toast: (opts: any) => void
 ) {
   try {
@@ -189,25 +163,21 @@ async function downloadMapPng(
       img.src = imgUrl;
     });
 
-    // Draw field polygon overlay on the canvas
-    const points = coords.map(({ lat, lng }) => {
-      const lngs = coords.map(c => c.lng);
-      const lats = coords.map(c => c.lat);
-      const minLng = Math.min(...lngs) - BUF;
-      const maxLng = Math.max(...lngs) + BUF;
-      const minLat = Math.min(...lats) - BUF;
-      const maxLat = Math.max(...lats) + BUF;
-      const x = ((lng - minLng) / (maxLng - minLng)) * SIZE;
-      const y = ((maxLat - lat) / (maxLat - minLat)) * SIZE + HEADER;
-      return { x, y };
-    });
-    ctx.beginPath();
+    // Draw the field outline (every plot and hole) on the canvas
+    const [minLng, minLat, maxLng, maxLat] = shapeBBox(shape, BUF);
     ctx.setLineDash([6, 3]);
     ctx.strokeStyle = "rgba(255,255,255,0.85)";
     ctx.lineWidth = 2;
-    points.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
-    ctx.closePath();
-    ctx.stroke();
+    for (const ring of shape.flatMap(plot => plot)) {
+      ctx.beginPath();
+      ring.forEach(([lng, lat], i) => {
+        const x = ((lng - minLng) / (maxLng - minLng)) * SIZE;
+        const y = ((maxLat - lat) / (maxLat - minLat)) * SIZE + HEADER;
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      });
+      ctx.closePath();
+      ctx.stroke();
+    }
 
     // Footer
     ctx.setLineDash([]);
@@ -282,14 +252,14 @@ function MapTile({
   date,
   type,
   label,
-  coords,
+  shape,
   fieldName,
 }: {
   fieldId: number;
   date: string;
   type: "ndvi" | "msi";
   label: string;
-  coords: { lat: number; lng: number }[];
+  shape: FieldShape;
   fieldName: string;
 }) {
   const [zoomed, setZoomed] = useState(false);
@@ -312,7 +282,7 @@ function MapTile({
   const handleDownload = async () => {
     if (!imgUrl) return;
     setDownloading(true);
-    await downloadMapPng(imgUrl, fieldName, date, type, coords, toast);
+    await downloadMapPng(imgUrl, fieldName, date, type, shape, toast);
     setDownloading(false);
   };
 
@@ -381,7 +351,7 @@ function MapTile({
         {imgUrl && (
           <ClippedMapImage
             imgUrl={imgUrl}
-            coords={coords}
+            shape={shape}
             label={label}
             onClick={() => setZoomed(true)}
           />
@@ -431,7 +401,7 @@ function MapTile({
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <p className="text-white/60 text-xs mb-1">Clipped to field boundary</p>
-                <ClippedMapImage imgUrl={imgUrl} coords={coords} label={label} onClick={() => {}} />
+                <ClippedMapImage imgUrl={imgUrl} shape={shape} label={label} onClick={() => {}} />
               </div>
               <div>
                 <p className="text-white/60 text-xs mb-1">Full scene context</p>
@@ -570,12 +540,12 @@ function StressZonesPanel({
 
 // ── Date window row (one observation date) ──────────────────────────────────
 function DateRow({
-  fieldId, date, cloudCover, coords, fieldName
+  fieldId, date, cloudCover, shape, fieldName
 }: {
   fieldId: number;
   date: string;
   cloudCover?: number | null;
-  coords: { lat: number; lng: number }[];
+  shape: FieldShape;
   fieldName: string;
 }) {
   return (
@@ -586,8 +556,8 @@ function DateRow({
         <Badge variant="outline" className="text-xs">{typeof cloudCover === "number" ? `${cloudCover}% field cloud` : "Sentinel-2 L2A"}</Badge>
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-        <MapTile fieldId={fieldId} date={date} type="ndvi" label="NDVI — Vegetation Index" coords={coords} fieldName={fieldName} />
-        <MapTile fieldId={fieldId} date={date} type="msi"  label="MSI — Moisture Stress"   coords={coords} fieldName={fieldName} />
+        <MapTile fieldId={fieldId} date={date} type="ndvi" label="NDVI — Vegetation Index" shape={shape} fieldName={fieldName} />
+        <MapTile fieldId={fieldId} date={date} type="msi"  label="MSI — Moisture Stress"   shape={shape} fieldName={fieldName} />
       </div>
       <div className="pt-3 border-t border-border space-y-4">
         <StressZonesPanel fieldId={fieldId} date={date} index="ndvi" indexLabel="NDVI" />
@@ -692,7 +662,7 @@ export default function SpatialMaps() {
               fieldId={selectedField.id}
               date={date}
               cloudCover={cloudCover}
-              coords={JSON.parse(selectedField.coordinates)}
+              shape={shapeFromField(selectedField)}
               fieldName={selectedField.name}
             />
           ))}

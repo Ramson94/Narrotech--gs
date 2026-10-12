@@ -13,6 +13,9 @@ import {
   PencilLine, Upload, KeyboardIcon, Trash2, Undo2
 } from "lucide-react";
 import { useAuth } from "@/lib/auth";
+import {
+  shapeFromGeoJSON, shapeFromCoords, shapeToGeoJSON, ringToLatLngs, vertexCount, type FieldShape,
+} from "@shared/geometry";
 
 // ── Constants ──────────────────────────────────────────────────────────────
 const GHANA_REGIONS = [
@@ -79,33 +82,6 @@ function getDefaultDates() {
   return { from: from.toISOString().split("T")[0], to: to.toISOString().split("T")[0] };
 }
 
-// ── GeoJSON → flat coordinate array ────────────────────────────────────────
-function extractCoordsFromGeoJSON(gj: any): LatLng[] | null {
-  try {
-    let features: any[] = [];
-    if (gj.type === "FeatureCollection") features = gj.features;
-    else if (gj.type === "Feature") features = [gj];
-    else if (gj.type === "Polygon" || gj.type === "MultiPolygon") features = [{ geometry: gj }];
-
-    // find first polygon geometry
-    for (const f of features) {
-      const geom = f.geometry || f;
-      if (!geom) continue;
-      let ring: number[][] | null = null;
-      if (geom.type === "Polygon") ring = geom.coordinates[0];
-      else if (geom.type === "MultiPolygon") ring = geom.coordinates[0][0];
-      if (ring && ring.length >= 3) {
-        // GeoJSON is [lng, lat] — convert, drop closing duplicate
-        const pts = ring.slice(0, ring[0][0] === ring[ring.length-1][0] && ring[0][1] === ring[ring.length-1][1]
-          ? ring.length - 1 : ring.length)
-          .map(([lng, lat]) => ({ lat, lng }));
-        return pts;
-      }
-    }
-  } catch {}
-  return null;
-}
-
 export default function FieldAnalysis() {
   const [, navigate] = useLocation();
   const { toast } = useToast();
@@ -127,6 +103,13 @@ export default function FieldAnalysis() {
 
   // Shared polygon state — array of LatLng (the "truth")
   const [polygon, setPolygon] = useState<LatLng[]>([]);
+  // Full shape from an uploaded file: every plot, holes kept. Drawn/typed boundaries are one plot.
+  const [uploadedShape, setUploadedShape] = useState<FieldShape | null>(null);
+  const fieldShape: FieldShape | null =
+    inputMode === "upload" && uploadedShape ? uploadedShape
+      : polygon.length >= 3 ? shapeFromCoords(polygon) : null;
+  const plotCount = fieldShape?.length ?? 0;
+  const holeCount = fieldShape ? fieldShape.reduce((n, p) => n + p.length - 1, 0) : 0;
 
   // Manual mode: 4 corner string inputs
   const [coords, setCoords] = useState<CoordStr[]>([
@@ -231,16 +214,17 @@ export default function FieldAnalysis() {
       polygonLayerRef.current = null;
     }
 
-    if (polygon.length < 3) return;
+    if (!fieldShape) return;
 
-    const latlngs = polygon.map(p => [p.lat, p.lng]);
+    // Every plot with its holes, exactly as it will be analysed.
+    const latlngs = fieldShape.map(plot => plot.map(ring => ring.map(([lng, lat]) => [lat, lng])));
     const poly = L.polygon(latlngs, {
       color: "#1E6FA3", weight: 2.5, fillColor: "#1E6FA3", fillOpacity: 0.18,
       dashArray: inputMode === "upload" ? "6 3" : undefined,
     }).addTo(map);
     polygonLayerRef.current = poly;
     map.fitBounds(poly.getBounds(), { padding: [32, 32] });
-  }, [polygon, inputMode]);
+  }, [polygon, inputMode, uploadedShape]);
 
   // ── Sync manual coords → polygon ─────────────────────────────────────────
   useEffect(() => {
@@ -293,19 +277,19 @@ export default function FieldAnalysis() {
     const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
 
     try {
-      let pts: LatLng[] | null = null;
+      let shape: FieldShape | null = null;
 
       if (ext === "geojson" || ext === "json") {
         // ── GeoJSON ───────────────────────────────────────────────────────
         const text = await file.text();
         const gj = JSON.parse(text);
-        pts = extractCoordsFromGeoJSON(gj);
+        shape = shapeFromGeoJSON(gj);
       } else if (ext === "zip" || ext === "shp") {
         // ── Shapefile (as .zip containing .shp/.dbf/.prj, or raw .shp) ───
         const shpjs = await import("shpjs");
         const buf = await file.arrayBuffer();
         const gj = await (shpjs.default || shpjs)(buf);
-        pts = extractCoordsFromGeoJSON(gj);
+        shape = shapeFromGeoJSON(gj);
       } else if (ext === "gpkg") {
         // ── GeoPackage — parse via SQLite WASM ────────────────────────────
         // GeoPackage is an SQLite file; we can't run SQLite in browser without
@@ -319,18 +303,21 @@ export default function FieldAnalysis() {
         return;
       }
 
-      if (!pts || pts.length < 3) {
+      if (!shape) {
         setUploadError("No valid polygon found in this file. Make sure it contains at least one Polygon geometry.");
         setUploadLoading(false);
         return;
       }
 
-      // Keep the uploaded boundary exactly as drawn — every vertex. The boundary is the only
-      // area the analysis uses, so it must never be simplified.
-      const finalPts = pts;
-
-      setPolygon(finalPts);
-      toast({ title: `${file.name} loaded — ${finalPts.length} vertices` });
+      // Keep the uploaded boundary exactly as it is — every plot, every hole, every vertex.
+      // It is the only area the analysis uses, so it is never simplified.
+      setUploadedShape(shape);
+      setPolygon(ringToLatLngs(shape[0][0]));
+      const holes = shape.reduce((n, p) => n + p.length - 1, 0);
+      toast({
+        title: `${file.name} loaded`,
+        description: `${shape.length} plot${shape.length > 1 ? "s" : ""}${holes ? `, ${holes} hole${holes > 1 ? "s" : ""} excluded` : ""} · ${vertexCount(shape)} vertices`,
+      });
     } catch (err: any) {
       console.error("[FileUpload]", err);
       setUploadError(`Failed to parse file: ${err?.message ?? "unknown error"}. Make sure Shapefiles are in a .zip archive.`);
@@ -375,6 +362,7 @@ export default function FieldAnalysis() {
       const field = await apiRequest("POST", "/api/fields", {
         name: fieldName, region, cropType,
         coordinates: JSON.stringify(polygon),
+        geometry: fieldShape ? JSON.stringify(shapeToGeoJSON(fieldShape)) : null,
         notes, dateFrom, dateTo,
       }).then(r => r.json());
       await runAnalyzeJob(field.id, { dateFrom, dateTo });
@@ -395,7 +383,7 @@ export default function FieldAnalysis() {
   // ── Render ─────────────────────────────────────────────────────────────────
   const modeTab = (mode: InputMode, icon: any, label: string, desc: string) => (
     <button
-      onClick={() => { setInputMode(mode); setPolygon([]); setUploadError(""); setUploadFileName(""); }}
+      onClick={() => { setInputMode(mode); setPolygon([]); setUploadedShape(null); setUploadError(""); setUploadFileName(""); }}
       className={`flex-1 flex flex-col items-center gap-1.5 p-3 rounded-xl border-2 text-center transition-all ${
         inputMode === mode
           ? "border-primary bg-primary/5 text-foreground"
@@ -654,10 +642,10 @@ export default function FieldAnalysis() {
                   {polygon.length >= 3 && !uploadError && (
                     <div className="flex items-center justify-between">
                       <p className="text-xs text-emerald-600 dark:text-emerald-400 flex items-center gap-1.5">
-                        <CheckCircle2 size={12} /> {polygon.length} vertices loaded from {uploadFileName}
+                        <CheckCircle2 size={12} /> {plotCount} plot{plotCount > 1 ? "s" : ""}{holeCount ? ` · ${holeCount} hole${holeCount > 1 ? "s" : ""} excluded` : ""} loaded from {uploadFileName}
                       </p>
                       <Button variant="ghost" size="sm" className="text-xs gap-1 text-red-500 h-6"
-                        onClick={() => { setPolygon([]); setUploadFileName(""); setUploadError(""); }}>
+                        onClick={() => { setPolygon([]); setUploadedShape(null); setUploadFileName(""); setUploadError(""); }}>
                         <Undo2 size={10} /> Clear
                       </Button>
                     </div>
@@ -710,7 +698,7 @@ export default function FieldAnalysis() {
           {polygon.length >= 3 && (
             <p className="text-xs text-emerald-600 dark:text-emerald-400 flex items-center gap-1.5">
               <CheckCircle2 size={12} />
-              Polygon visible on map · {polygon.length} vertices
+              Boundary visible on map · {plotCount > 1 ? `${plotCount} plots · ` : ""}{holeCount ? `${holeCount} hole${holeCount > 1 ? "s" : ""} excluded · ` : ""}{fieldShape ? vertexCount(fieldShape) : polygon.length} vertices · only this area is analysed
             </p>
           )}
           {polygon.length < 3 && (

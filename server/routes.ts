@@ -9,8 +9,9 @@ import { sendWhatsAppNotification, buildWhatsAppMessage } from "./whatsapp";
 import {
   MAX_FIELD_CLOUD_PCT, FALLBACK_DAYS, SCL_CLOUD_CLASSES, SCL_WATER_CLASS,
   biweeklyWindows, selectImagesForWindows, fieldGeometry, bboxOf, gridSize, addDays, fieldPixelCount,
-  type DailyObservation, type LatLng,
+  type DailyObservation,
 } from "./imagery";
+import { shapeFromField, pointInShape, type FieldShape } from "@shared/geometry";
 // ─── Auth middleware (inline to avoid esbuild hoisting issues) ─────────────
 import type { Request, Response, NextFunction } from "express";
 function requireAuth(req: Request, res: Response, next: NextFunction) {
@@ -239,11 +240,11 @@ async function fetchDailyChunk(token: string, geometry: object, bbox: number[], 
   throw new Error(`Satellite statistics request failed (${from} to ${to}): ${lastErr}`);
 }
 
-async function fetchDailyObservations(token: string, coords: LatLng[], from: string, to: string): Promise<DailyObservation[]> {
-  const geometry = fieldGeometry(coords);
-  const bbox = bboxOf(coords);
+async function fetchDailyObservations(token: string, shape: FieldShape, from: string, to: string): Promise<DailyObservation[]> {
+  const geometry = fieldGeometry(shape);
+  const bbox = bboxOf(shape);
   const size = gridSize(bbox, 10, 32, 256);
-  const grid = { ...size, fieldPixels: fieldPixelCount(coords, bbox, size.width, size.height) };
+  const grid = { ...size, fieldPixels: fieldPixelCount(shape, bbox, size.width, size.height) };
   const chunks: { from: string; to: string }[] = [];
   for (let f = from; f <= to; f = addDays(f, STATS_CHUNK_DAYS)) {
     const t = addDays(f, STATS_CHUNK_DAYS - 1);
@@ -384,11 +385,11 @@ function decodeFloat32Tiff(buf: Buffer): { width: number; height: number; sample
 // valid (non-cloud, non-oversaturated) pixel as an (ndvi, str) pair.
 async function fetchOptramRaster(
   token: string,
-  coords: LatLng[],
+  shape: FieldShape,
   date: string
 ): Promise<PixelSample[]> {
-  // Exactly the qualifying image's acquisition date, clipped to the field polygon.
-  const bbox = bboxOf(coords);
+  // Exactly the qualifying image's acquisition date, clipped to the field shape (holes excluded).
+  const bbox = bboxOf(shape);
   const { width, height } = gridSize(bbox, OPTRAM_TARGET_METERS, 1, OPTRAM_MAX_DIM);
 
   const evalscript = [
@@ -417,7 +418,7 @@ async function fetchOptramRaster(
 
   const body = {
     input: {
-      bounds: { geometry: fieldGeometry(coords), properties: { crs: "http://www.opengis.net/def/crs/EPSG/0/4326" } },
+      bounds: { geometry: fieldGeometry(shape), properties: { crs: "http://www.opengis.net/def/crs/EPSG/0/4326" } },
       data: [{
         type: "sentinel-2-l2a",
         dataFilter: { timeRange: { from: `${date}T00:00:00Z`, to: `${date}T23:59:59Z` } }
@@ -589,7 +590,7 @@ type SeriesPoint = {
   windowFrom: string; windowTo: string;
 };
 
-async function fetchSentinelHubData(coordinates: LatLng[], dateFrom: string, dateTo: string): Promise<SeriesPoint[]> {
+async function fetchSentinelHubData(shape: FieldShape, dateFrom: string, dateTo: string): Promise<SeriesPoint[]> {
   // Satellite data only — there is no simulated fallback.
   const token = await getSentinelToken();
   if (!token) {
@@ -600,7 +601,7 @@ async function fetchSentinelHubData(coordinates: LatLng[], dateFrom: string, dat
   // Look FALLBACK_DAYS beyond the range so the first/last windows can also borrow a nearby image.
   const today = new Date().toISOString().slice(0, 10);
   const fetchTo = addDays(dateTo, FALLBACK_DAYS) > today ? today : addDays(dateTo, FALLBACK_DAYS);
-  const daily = await fetchDailyObservations(token, coordinates, addDays(dateFrom, -FALLBACK_DAYS), fetchTo);
+  const daily = await fetchDailyObservations(token, shape, addDays(dateFrom, -FALLBACK_DAYS), fetchTo);
   const picks = selectImagesForWindows(windows, daily);
   for (const d of daily) {
     const b = d.breakdown;
@@ -631,7 +632,7 @@ async function fetchSentinelHubData(coordinates: LatLng[], dateFrom: string, dat
 
   // ── OPTRAM per-pixel calibration across all selected images ──
   const rasters = await Promise.all(
-    results.map(r => (!r.excluded && !r.isWater ? fetchOptramRaster(token, coordinates, r.date) : Promise.resolve([] as PixelSample[])))
+    results.map(r => (!r.excluded && !r.isWater ? fetchOptramRaster(token, shape, r.date) : Promise.resolve([] as PixelSample[])))
   );
   const pool: PixelSample[] = [];
   for (const px of rasters) for (const p of px) pool.push(p);
@@ -735,8 +736,7 @@ async function runFieldAnalysis(
   if (!field) throw new Error("Field not found");
 
   const { dateFrom, dateTo } = opts;
-  const coords = JSON.parse(field.coordinates);
-  const timeSeriesData = await fetchSentinelHubData(coords, dateFrom, dateTo);
+  const timeSeriesData = await fetchSentinelHubData(shapeFromField(field), dateFrom, dateTo);
   const { ndvi, ndwi, healthScore } = computeAggregates(timeSeriesData);
 
   const updated = storage.updateField(field.id, {
@@ -880,10 +880,10 @@ export function registerRoutes(httpServer: Server, app: Express) {
     const results = [];
     for (const field of due) {
       try {
-        const coords = JSON.parse(field.coordinates);
+        const shape = shapeFromField(field);
         const dateFrom = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
         const dateTo = new Date().toISOString().split("T")[0];
-        const fresh = await fetchSentinelHubData(coords, dateFrom, dateTo);
+        const fresh = await fetchSentinelHubData(shape, dateFrom, dateTo);
         // Add the new observation to the field's existing history instead of replacing it.
         const previous: any[] = field.timeSeriesData ? JSON.parse(field.timeSeriesData) : [];
         const freshDates = new Set(fresh.map(p => p.date));
@@ -937,9 +937,9 @@ export function registerRoutes(httpServer: Server, app: Express) {
       if (type !== "ndvi" && type !== "msi") return res.status(400).json({ error: "type must be ndvi or msi" });
       if (!qualifyingDate(field, date)) return res.status(400).json({ error: NOT_QUALIFYING });
 
-      const coords = JSON.parse(field.coordinates) as { lat: number; lng: number }[];
-      // Small buffer (~500m) so the field isn't clipped at the edge
-      const bbox = bboxOf(coords, 0.005);
+      const shape = shapeFromField(field);
+      // Small buffer (~500m) around the field; everything outside the field is made transparent below.
+      const bbox = bboxOf(shape, 0.005);
 
       const token = await getSentinelToken();
       if (!token) {
@@ -1013,7 +1013,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
 
       // Make every pixel outside the field boundary transparent, so the map shows only the field.
       const rendered = decodePNG(Buffer.from(await imgRes.arrayBuffer()));
-      const clipped = clipPngToField(rendered, bbox, coords);
+      const clipped = clipPngToField(rendered, bbox, shape);
       res.set("Content-Type", "image/png");
       res.set("Cache-Control", "public, max-age=86400"); // cache 24h — same date always gives same image
       res.send(clipped);
@@ -1027,7 +1027,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
   // ─── Clip a rendered map to the field boundary (RGBA PNG, transparent outside) ──
   function clipPngToField(
     png: { width: number; height: number; channels: number; pixels: Buffer },
-    bbox: number[], coords: { lat: number; lng: number }[],
+    bbox: number[], shape: FieldShape,
   ): Buffer {
     const { width, height, channels, pixels } = png;
     const [minLng, minLat, maxLng, maxLat] = bbox;
@@ -1041,7 +1041,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
         rgba[dst] = pixels[src];
         rgba[dst + 1] = gray ? pixels[src] : pixels[src + 1];
         rgba[dst + 2] = gray ? pixels[src] : pixels[src + 2];
-        rgba[dst + 3] = pointInPolygon(lat, lng, coords) ? 255 : 0;
+        rgba[dst + 3] = pointInShape(lat, lng, shape) ? 255 : 0;
       }
     }
     return encodePNG(width, height, rgba);
@@ -1141,19 +1141,6 @@ export function registerRoutes(httpServer: Server, app: Express) {
     return { width, height, channels, pixels };
   }
 
-  // Point-in-polygon test (ray casting) — coords is [{lat,lng}, ...]
-  function pointInPolygon(lat: number, lng: number, coords: { lat: number; lng: number }[]): boolean {
-    let inside = false;
-    for (let i = 0, j = coords.length - 1; i < coords.length; j = i++) {
-      const xi = coords[i].lng, yi = coords[i].lat;
-      const xj = coords[j].lng, yj = coords[j].lat;
-      const intersect = ((yi > lat) !== (yj > lat)) &&
-        (lng < ((xj - xi) * (lat - yi)) / (yj - yi) + xi);
-      if (intersect) inside = !inside;
-    }
-    return inside;
-  }
-
   // ─── DBSCAN clustering over grid cells ──────────────────────────────────────
   // Groups density-connected stressed cells into irregularly-shaped clusters
   // instead of anchoring one pin per isolated worst pixel. Distance metric is
@@ -1220,12 +1207,9 @@ export function registerRoutes(httpServer: Server, app: Express) {
       if (!qualifyingDate(field, date)) return res.status(400).json({ error: NOT_QUALIFYING });
       const limit = Math.max(1, Math.min(10, parseInt(maxZones) || 5));
 
-      const coords = JSON.parse(field.coordinates) as { lat: number; lng: number }[];
-      const lats = coords.map(c => c.lat);
-      const lngs = coords.map(c => c.lng);
-      const buf = 0.002; // smaller buffer than the display map — we want the grid tight to the field
-      const minLng = Math.min(...lngs) - buf, minLat = Math.min(...lats) - buf;
-      const maxLng = Math.max(...lngs) + buf, maxLat = Math.max(...lats) + buf;
+      const shape = shapeFromField(field);
+      // Small buffer — the grid stays tight to the field; cells outside the field are discarded.
+      const [minLng, minLat, maxLng, maxLat] = bboxOf(shape, 0.002);
       const bbox = [minLng, minLat, maxLng, maxLat];
 
       const token = await getSentinelToken();
@@ -1314,7 +1298,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
           // Cell center lat/lng (image row 0 = top = maxLat)
           const lng = minLng + (col + 0.5) * lngStep;
           const lat = maxLat - (row + 0.5) * latStep;
-          if (!pointInPolygon(lat, lng, coords)) continue; // only keep cells inside the actual field shape
+          if (!pointInShape(lat, lng, shape)) continue; // only cells inside the field (plots, not holes)
           const value = raw / 254; // normalized 0-1
           cells.push({ row, col, lat, lng, value, raw });
         }

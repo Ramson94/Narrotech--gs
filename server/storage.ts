@@ -84,6 +84,7 @@ export async function initStorage(): Promise<void> {
       region TEXT NOT NULL DEFAULT '',
       crop_type TEXT NOT NULL DEFAULT '',
       coordinates TEXT NOT NULL,
+      geometry TEXT,
       ndvi REAL,
       ndwi REAL,
       evi REAL,
@@ -134,6 +135,7 @@ export async function initStorage(): Promise<void> {
     "ALTER TABLE fields ADD COLUMN last_notified_at TEXT",
     "ALTER TABLE fields ADD COLUMN notifications_enabled INTEGER DEFAULT 1",
     "ALTER TABLE fields ADD COLUMN evi REAL",
+    "ALTER TABLE fields ADD COLUMN geometry TEXT",
   ];
   for (const stmt of migrateColumns) {
     try { sqlite.run(stmt); } catch (_) { /* column already exists — safe to ignore */ }
