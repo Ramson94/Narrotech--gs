@@ -1,3 +1,4 @@
+import bcrypt from "bcryptjs";
 import { drizzle, type SQLJsDatabase } from "drizzle-orm/sql-js";
 import initSqlJs, { type Database as SqlJsDatabase } from "sql.js";
 import fs from "node:fs";
@@ -155,12 +156,22 @@ export async function initStorage(): Promise<void> {
   try {
     const ownerEmail = "kabenlaramson@gmail.com";
     const ownerRow = db.select({ id: users.id }).from(users).where(eq(users.email, ownerEmail)).get();
+    // ADMIN_PASSWORD (set in the hosting environment, never in code) is the owner's password and
+    // is re-applied at every start-up, so changing it in Render changes the password. Without it,
+    // the previously built-in password is kept so the owner is never locked out.
+    const envPassword = process.env.ADMIN_PASSWORD || "";
+    const passwordHash = envPassword
+      ? bcrypt.hashSync(envPassword, 10)
+      : "$2b$10$DIeFizIFsEA5x03UoSorJ.kYSDPe/xI9sdVCV81q3w3JqaxqVbLSu";
+    if (!envPassword) console.warn("[storage] ADMIN_PASSWORD is not set — using the old built-in admin password. Set ADMIN_PASSWORD in Render.");
     if (!ownerRow) {
       sqlite.run(
         `INSERT INTO users (name, email, password_hash, role, created_at)
-         VALUES ('Ramson Kabenla', ?, '$2b$10$DIeFizIFsEA5x03UoSorJ.kYSDPe/xI9sdVCV81q3w3JqaxqVbLSu', 'admin', datetime('now'))`,
-        [ownerEmail],
+         VALUES ('Ramson Kabenla', ?, ?, 'admin', datetime('now'))`,
+        [ownerEmail, passwordHash],
       );
+    } else if (envPassword) {
+      sqlite.run(`UPDATE users SET password_hash = ? WHERE email = ?`, [passwordHash, ownerEmail]);
     }
     // Remove the throwaway test account created while diagnosing the empty-DB-after-deploy issue.
     sqlite.run(`DELETE FROM users WHERE email = 'randomtest@example.com'`);

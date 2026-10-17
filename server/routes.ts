@@ -3,6 +3,7 @@ import { Server } from "http";
 import zlib from "zlib";
 import { randomUUID } from "crypto";
 import { storage } from "./storage";
+import { ADMIN_ONLY } from "./access";
 import { insertFieldSchema } from "@shared/schema";
 import { generateFieldReport } from "./report";
 import { sendWhatsAppNotification, buildWhatsAppMessage } from "./whatsapp";
@@ -12,11 +13,19 @@ import {
   type DailyObservation,
 } from "./imagery";
 import { shapeFromField, pointInShape, type FieldShape } from "@shared/geometry";
+import { SPOT_TEXT, type ProblemSpot, type SpotKind, type SpotsResult } from "@shared/spots";
 // ─── Auth middleware (inline to avoid esbuild hoisting issues) ─────────────
 import type { Request, Response, NextFunction } from "express";
+// The platform is currently private to the administrator: every data route requires an admin
+// session. To open it to farmers later, set ADMIN_ONLY to false in server/access.ts.
 function requireAuth(req: Request, res: Response, next: NextFunction) {
-  if ((req as any).session?.userId) return next();
-  res.status(401).json({ error: "Unauthorized" });
+  const userId = (req as any).session?.userId;
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
+  if (ADMIN_ONLY) {
+    const user = storage.getUserById(userId);
+    if (!user || user.role !== "admin") return res.status(403).json({ error: "Access is limited to the administrator" });
+  }
+  next();
 }
 function requireAdmin(req: Request, res: Response, next: NextFunction) {
   const userId = (req as any).session?.userId;
@@ -770,7 +779,7 @@ export function registerRoutes(httpServer: Server, app: Express) {
   app.get("/api/ping", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
   // Satellite connection status: actually attempts (or reuses a cached) Copernicus OAuth2 token
-  app.get("/api/settings/sentinel-status", async (_req, res) => {
+  app.get("/api/settings/sentinel-status", requireAuth, async (_req, res) => {
     const token = await getSentinelToken();
     res.json({ connected: !!token, mode: "Copernicus SentinelHub API" });
   });
@@ -1191,41 +1200,36 @@ export function registerRoutes(httpServer: Server, app: Express) {
     return clusters;
   }
 
-  // ─── Stress zones: find worst sub-areas within a field and return GPS pins ──
-  // Requests a coarse grayscale grid from Sentinel Hub where pixel intensity
-  // directly encodes the normalized index value (0-255), decodes it locally,
-  // filters to cells inside the actual field polygon (not just its bbox),
-  // then clusters the worst cells into a handful of navigable zones.
-  app.get("/api/fields/:id/stress-zones", requireAuth, async (req, res) => {
-    try {
-      const field = storage.getField(Number(req.params.id));
-      if (!field) return res.status(404).json({ error: "Not found" });
+  // ─── Problem spots ("Go here") ────────────────────────────────────────────
+  // For one qualifying image date, request a coarse grid of NDVI or MSI values over the field, keep
+  // only cells inside the field (plots, not holes; no cloud/shadow/water), and cluster the cells that
+  // are clearly worse than the field's own average into a few patches with GPS pins.
+  const ZONE_GRID = 40;            // 40 x 40 cells over the field's bounding box
+  const ZONE_QUALIFY = 0.12;       // a cell must be this much worse than the field mean (0-1 scale)
+  const ZONE_CRITICAL = 0.25;      // patches this much worse are "critical"
 
-      const { date, index = "ndvi", maxZones = "5" } = req.query as { date?: string; index?: string; maxZones?: string };
-      if (!date) return res.status(400).json({ error: "date query param required (YYYY-MM-DD)" });
-      if (index !== "ndvi" && index !== "msi") return res.status(400).json({ error: "index must be ndvi or msi" });
-      if (!qualifyingDate(field, date)) return res.status(400).json({ error: NOT_QUALIFYING });
-      const limit = Math.max(1, Math.min(10, parseInt(maxZones) || 5));
+  type RawZone = { lat: number; lng: number; worstValue: number; cellCount: number; deviation: number };
+  type ZoneResult = { zones: RawZone[]; fieldMean: number | null; cellAreaHa: number; cellDeg: number; message?: string };
 
-      const shape = shapeFromField(field);
-      // Small buffer — the grid stays tight to the field; cells outside the field are discarded.
-      const [minLng, minLat, maxLng, maxLat] = bboxOf(shape, 0.002);
-      const bbox = [minLng, minLat, maxLng, maxLat];
+  // Index value from the 0-1 value encoded in the grid
+  const fromNormalized = (index: "ndvi" | "msi", v: number) => (index === "ndvi" ? v - 0.2 : v * 1.5 + 0.1);
 
-      const token = await getSentinelToken();
-      if (!token) {
-        return res.status(503).json({ error: "No Sentinel Hub token — check credentials" });
-      }
+  async function computeStressZones(field: { coordinates: string; geometry?: string | null }, date: string, index: "ndvi" | "msi"): Promise<ZoneResult> {
+    const shape = shapeFromField(field);
+    const [minLng, minLat, maxLng, maxLat] = bboxOf(shape, 0.002);
+    const bbox = [minLng, minLat, maxLng, maxLat];
+    const midLat = (minLat + maxLat) / 2;
+    const cellW = ((maxLng - minLng) * 111320 * Math.cos((midLat * Math.PI) / 180)) / ZONE_GRID;
+    const cellH = ((maxLat - minLat) * 111320) / ZONE_GRID;
+    const cellAreaHa = (cellW * cellH) / 10000;
+    const cellDeg = Math.max((maxLng - minLng), (maxLat - minLat)) / ZONE_GRID;
 
-      const GRID = 40; // 40x40 grid — fine enough for sub-field zones, coarse enough to be fast
+    const token = await getSentinelToken();
+    if (!token) throw Object.assign(new Error("No Sentinel Hub token — check credentials"), { status: 503 });
 
-      // Evalscript encodes the raw index value directly as an 8-bit grayscale value.
-      // Cloud, cirrus, cloud shadow, no-data and water pixels are encoded as 255 and excluded.
-      let evalscript: string;
-      let isStressHigh: boolean; // true = higher raw value means MORE stress (MSI)
-      if (index === "msi") {
-        isStressHigh = true;
-        evalscript = [
+    const isStressHigh = index === "msi"; // high MSI = drier; low NDVI = weaker
+    const evalscript = index === "msi"
+      ? [
           "//VERSION=3",
           "function setup(){return{input:[{bands:['B8A','B11','SCL','dataMask']}],output:{bands:1,sampleType:'UINT8'}};}",
           "function evaluatePixel(s){",
@@ -1234,10 +1238,8 @@ export function registerRoutes(httpServer: Server, app: Express) {
           "  var v=Math.max(0,Math.min(1,(msi-0.1)/1.5));",
           "  return[Math.round(v*254)];",
           "}"
-        ].join("\n");
-      } else {
-        isStressHigh = false; // low NDVI = more stress
-        evalscript = [
+        ].join("\n")
+      : [
           "//VERSION=3",
           "function setup(){return{input:[{bands:['B04','B08','SCL','dataMask']}],output:{bands:1,sampleType:'UINT8'}};}",
           "function evaluatePixel(s){",
@@ -1247,161 +1249,141 @@ export function registerRoutes(httpServer: Server, app: Express) {
           "  return[Math.round(v*254)];",
           "}"
         ].join("\n");
-      }
 
-      const body = {
-        input: {
-          bounds: { bbox, properties: { crs: "http://www.opengis.net/def/crs/EPSG/0/4326" } },
-          data: [{
-            type: "sentinel-2-l2a",
-            dataFilter: {
-              timeRange: { from: `${date}T00:00:00Z`, to: `${date}T23:59:59Z` }
-            }
-          }]
-        },
-        output: { width: GRID, height: GRID, responses: [{ identifier: "default", format: { type: "image/png" } }] },
-        evalscript
+    const body = {
+      input: {
+        bounds: { bbox, properties: { crs: "http://www.opengis.net/def/crs/EPSG/0/4326" } },
+        data: [{ type: "sentinel-2-l2a", dataFilter: { timeRange: { from: `${date}T00:00:00Z`, to: `${date}T23:59:59Z` } } }]
+      },
+      output: { width: ZONE_GRID, height: ZONE_GRID, responses: [{ identifier: "default", format: { type: "image/png" } }] },
+      evalscript
+    };
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
+    const imgRes = await fetch(SENTINEL_API, {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json", "Accept": "image/png" },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    clearTimeout(timeout);
+    if (!imgRes.ok) {
+      const err = await imgRes.text();
+      console.warn("Problem-spot grid error:", imgRes.status, err.slice(0, 200));
+      throw Object.assign(new Error("Problem spot analysis failed"), { status: imgRes.status });
+    }
+
+    const decoded = decodePNG(Buffer.from(await imgRes.arrayBuffer()));
+    type Cell = { row: number; col: number; lat: number; lng: number; value: number };
+    const cells: Cell[] = [];
+    const lngStep = (maxLng - minLng) / decoded.width;
+    const latStep = (maxLat - minLat) / decoded.height;
+    for (let row = 0; row < decoded.height; row++) {
+      for (let col = 0; col < decoded.width; col++) {
+        const raw = decoded.pixels[row * decoded.width * decoded.channels + col * decoded.channels];
+        if (raw === 255) continue; // cloud / shadow / water / no data
+        const lng = minLng + (col + 0.5) * lngStep;
+        const lat = maxLat - (row + 0.5) * latStep;
+        if (!pointInShape(lat, lng, shape)) continue; // only inside the field (plots, not holes)
+        cells.push({ row, col, lat, lng, value: raw / 254 });
+      }
+    }
+    if (cells.length === 0) {
+      return { zones: [], fieldMean: null, cellAreaHa, cellDeg, message: "No clear pixels inside the field on this date." };
+    }
+
+    const meanValue = cells.reduce((sum, c) => sum + c.value, 0) / cells.length;
+    const deviationOf = (v: number) => (isStressHigh ? v - meanValue : meanValue - v);
+    const stressed = cells.filter(c => deviationOf(c.value) > ZONE_QUALIFY);
+    const zones: RawZone[] = dbscanCluster(stressed, 1.5, 1).map(cluster => {
+      let worst = cluster[0], wSum = 0, latSum = 0, lngSum = 0;
+      for (const c of cluster) {
+        if (deviationOf(c.value) > deviationOf(worst.value)) worst = c;
+        const w = Math.max(deviationOf(c.value), 0.001); // pull the pin toward the worst part
+        wSum += w; latSum += c.lat * w; lngSum += c.lng * w;
+      }
+      return { lat: latSum / wSum, lng: lngSum / wSum, worstValue: worst.value, cellCount: cluster.length, deviation: deviationOf(worst.value) };
+    }).sort((a, b) => b.deviation - a.deviation);
+
+    return { zones, fieldMean: meanValue, cellAreaHa, cellDeg };
+  }
+
+  function latestQualifyingDate(field: { timeSeriesData: string | null }): string | null {
+    const ts: any[] = field.timeSeriesData ? JSON.parse(field.timeSeriesData) : [];
+    const valid = ts.filter(d => !d.excluded && !d.isWater && d.ndvi !== null).map(d => d.date as string).sort();
+    return valid.length ? valid[valid.length - 1] : null;
+  }
+
+  // Weak (NDVI) and dry (MSI) patches combined into one ranked list of places to check.
+  async function computeProblemSpots(
+    field: { coordinates: string; geometry?: string | null; timeSeriesData: string | null },
+    date: string | null,
+    limit = 5,
+  ): Promise<SpotsResult> {
+    const d = date || latestQualifyingDate(field);
+    if (!d) return { date: null, spots: [], message: "Run an analysis first — no satellite image is available for this field yet." };
+    const [weak, dry] = await Promise.all([computeStressZones(field, d, "ndvi"), computeStressZones(field, d, "msi")]);
+    const round = (x: number, n = 3) => Math.round(x * 10 ** n) / 10 ** n;
+
+    type Merged = { lat: number; lng: number; dev: number; cells: number; weak?: RawZone; dry?: RawZone };
+    const merged: Merged[] = weak.zones.map(z => ({ lat: z.lat, lng: z.lng, dev: z.deviation, cells: z.cellCount, weak: z }));
+    for (const z of dry.zones) {
+      // A dry patch within ~2 grid cells of a weak patch is the same place: merge them.
+      const near = merged.find(m => m.weak && !m.dry && Math.hypot(m.lat - z.lat, m.lng - z.lng) <= 2 * weak.cellDeg);
+      if (near) { near.dry = z; near.dev = Math.max(near.dev, z.deviation); near.cells = Math.max(near.cells, z.cellCount); }
+      else merged.push({ lat: z.lat, lng: z.lng, dev: z.deviation, cells: z.cellCount, dry: z });
+    }
+    merged.sort((a, b) => b.dev - a.dev);
+
+    const spots: ProblemSpot[] = merged.slice(0, limit).map((m, i) => {
+      const kind: SpotKind = m.weak && m.dry ? "weak_dry" : m.weak ? "weak" : "dry";
+      return {
+        label: String.fromCharCode(65 + i),
+        lat: round(m.lat, 6), lng: round(m.lng, 6),
+        kind,
+        severity: m.dev > ZONE_CRITICAL ? "critical" : "warning",
+        reason: SPOT_TEXT[kind].reason,
+        check: SPOT_TEXT[kind].check,
+        areaHa: round(m.cells * weak.cellAreaHa, 2),
+        ...(m.weak && weak.fieldMean !== null ? { ndvi: round(fromNormalized("ndvi", m.weak.worstValue)), fieldNdvi: round(fromNormalized("ndvi", weak.fieldMean)) } : {}),
+        ...(m.dry && dry.fieldMean !== null ? { msi: round(fromNormalized("msi", m.dry.worstValue)), fieldMsi: round(fromNormalized("msi", dry.fieldMean)) } : {}),
       };
+    });
 
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 20000);
-      const imgRes = await fetch(SENTINEL_API, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${token}`,
-          "Content-Type": "application/json",
-          "Accept": "image/png"
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal
-      });
-      clearTimeout(timeout);
+    const message = spots.length ? undefined
+      : weak.message || "No problem spots — the field looks even on this date.";
+    return { date: d, spots, message };
+  }
 
-      if (!imgRes.ok) {
-        const err = await imgRes.text();
-        console.warn("Stress-zones render error:", imgRes.status, err.slice(0, 200));
-        return res.status(imgRes.status).json({ error: "Stress zone analysis failed", detail: err.slice(0, 200) });
-      }
-
-      const pngBuf = Buffer.from(await imgRes.arrayBuffer());
-      const decoded = decodePNG(pngBuf);
-
-      // Build candidate cells: grid position → lat/lng → raw value
-      type Cell = { row: number; col: number; lat: number; lng: number; value: number; raw: number };
-      const cells: Cell[] = [];
-      const lngStep = (maxLng - minLng) / decoded.width;
-      const latStep = (maxLat - minLat) / decoded.height;
-      for (let row = 0; row < decoded.height; row++) {
-        for (let col = 0; col < decoded.width; col++) {
-          const raw = decoded.pixels[row * decoded.width * decoded.channels + col * decoded.channels];
-          if (raw === 255) continue; // cloud/water excluded
-          // Cell center lat/lng (image row 0 = top = maxLat)
-          const lng = minLng + (col + 0.5) * lngStep;
-          const lat = maxLat - (row + 0.5) * latStep;
-          if (!pointInShape(lat, lng, shape)) continue; // only cells inside the field (plots, not holes)
-          const value = raw / 254; // normalized 0-1
-          cells.push({ row, col, lat, lng, value, raw });
-        }
-      }
-
-      if (cells.length === 0) {
-        return res.json({ zones: [], message: "No valid pixels found inside field boundary for this date (cloud cover or field too small)." });
-      }
-
-      // Compute overall field stats for context (mean value of valid cells)
-      const meanValue = cells.reduce((s, c) => s + c.value, 0) / cells.length;
-      const deviationOf = (v: number) => isStressHigh ? v - meanValue : meanValue - v;
-
-      // Only cluster cells that actually qualify as stressed ("moderate" threshold
-      // or worse) — clustering the whole field would just produce one giant blob.
-      const STRESS_QUALIFY_DEVIATION = 0.12;
-      const stressedCells = cells.filter(c => deviationOf(c.value) > STRESS_QUALIFY_DEVIATION);
-
-      if (stressedCells.length === 0) {
-        return res.json({
-          index: index.toLowerCase(),
-          date,
-          fieldMean: Math.round(meanValue * 1000) / 1000,
-          zones: [],
-          message: "No distinct stress zones — field looks fairly uniform for this date.",
-        });
-      }
-
-      // DBSCAN groups density-connected stressed cells into irregularly-shaped
-      // clusters (handles the "2 bad pixels on the left, 2 on the right" case
-      // correctly — those become two separate clusters since they're far apart,
-      // while adjacent bad pixels within the same patch merge into one cluster).
-      const rawClusters = dbscanCluster(stressedCells, 1.5, 1);
-
-      // For each cluster: pin location = severity-weighted centroid (pulls the
-      // pin toward the worst part of an irregular blob rather than its plain
-      // geometric center); reported value/severity = the single worst cell in
-      // that cluster (so the number shown matches what's physically near the pin).
-      type ClusterSummary = {
-        lat: number; lng: number; worstValue: number; cellCount: number; deviation: number;
-      };
-      const clusterSummaries: ClusterSummary[] = rawClusters.map(cluster => {
-        let worst = cluster[0];
-        for (const c of cluster) {
-          if (deviationOf(c.value) > deviationOf(worst.value)) worst = c;
-        }
-        let wSum = 0, latSum = 0, lngSum = 0;
-        for (const c of cluster) {
-          const w = Math.max(deviationOf(c.value), 0.001); // weight by stress severity
-          wSum += w;
-          latSum += c.lat * w;
-          lngSum += c.lng * w;
-        }
-        return {
-          lat: latSum / wSum,
-          lng: lngSum / wSum,
-          worstValue: worst.value,
-          cellCount: cluster.length,
-          deviation: deviationOf(worst.value),
-        };
-      });
-
-      // Rank clusters by their worst-cell severity, cap at the requested limit.
-      clusterSummaries.sort((a, b) => b.deviation - a.deviation);
-      const topClusters = clusterSummaries.slice(0, limit);
-
-      const result = topClusters.map((z, i) => {
-        let severity: "critical" | "warning" | "moderate";
-        if (z.deviation > 0.25) severity = "critical";
-        else if (z.deviation > 0.12) severity = "warning";
-        else severity = "moderate";
-        return {
-          id: i + 1,
-          label: `Zone ${String.fromCharCode(65 + i)}`, // Zone A, B, C...
-          lat: Math.round(z.lat * 1e6) / 1e6,
-          lng: Math.round(z.lng * 1e6) / 1e6,
-          value: Math.round(z.worstValue * 1000) / 1000,
-          severity,
-          cellCount: z.cellCount,
-          navigateUrl: `https://www.google.com/maps/dir/?api=1&destination=${z.lat.toFixed(6)},${z.lng.toFixed(6)}&travelmode=walking`,
-        };
-      });
-
-      res.json({
-        index: index.toLowerCase(),
-        date,
-        fieldMean: Math.round(meanValue * 1000) / 1000,
-        zones: result,
-      });
-    } catch (err) {
-      console.error("Stress-zones route error:", err);
-      res.status(500).json({ error: "Stress zone analysis failed", detail: String(err) });
+  // Problem spots for a field on one qualifying image date (default: the latest).
+  app.get("/api/fields/:id/spots", requireAuth, async (req, res) => {
+    try {
+      const field = storage.getField(Number(req.params.id));
+      if (!field) return res.status(404).json({ error: "Not found" });
+      const date = (req.query.date as string | undefined) || null;
+      if (date && !qualifyingDate(field, date)) return res.status(400).json({ error: NOT_QUALIFYING });
+      res.json(await computeProblemSpots(field, date));
+    } catch (err: any) {
+      console.error("Problem spots error:", err);
+      res.status(err?.status || 500).json({ error: "Problem spot analysis failed", detail: String(err?.message || err) });
     }
   });
+
+  // Spots for the report and WhatsApp: never block them if the satellite request fails.
+  async function spotsForMessages(field: Parameters<typeof computeProblemSpots>[0]): Promise<ProblemSpot[]> {
+    try { return (await computeProblemSpots(field, null, 3)).spots; }
+    catch (err) { console.warn("Problem spots unavailable for report/message:", err); return []; }
+  }
 
   // ── PDF Report endpoint ─────────────────────────────────────────────────
   app.get("/api/fields/:id/report", requireAuth, async (req: Request, res: Response) => {
     try {
-      const id = parseInt(req.params.id);
+      const id = parseInt(req.params.id as string);
       const field = storage.getField(id);
       if (!field) return res.status(404).json({ error: "Field not found" });
       const fieldAlerts = storage.getAlertsByField(id);
-      const pdfBuffer = await generateFieldReport(field, fieldAlerts);
+      const pdfBuffer = await generateFieldReport(field, fieldAlerts, await spotsForMessages(field));
       const safeName = field.name.replace(/[^a-zA-Z0-9-_]/g, "-").slice(0, 40);
       const filename = `narrowtech-gs_${safeName}_${new Date().toISOString().slice(0,10)}.pdf`;
       res.set("Content-Type", "application/pdf");
@@ -1417,15 +1399,13 @@ export function registerRoutes(httpServer: Server, app: Express) {
   // ── WhatsApp notification endpoint ──────────────────────────────────────
   app.post("/api/fields/:id/notify-whatsapp", requireAuth, async (req: Request, res: Response) => {
     try {
-      const id = parseInt(req.params.id);
+      const id = parseInt(req.params.id as string);
       const field = storage.getField(id);
       if (!field) return res.status(404).json({ error: "Field not found" });
       const fieldAlerts = storage.getAlertsByField(id);
-      const result = await sendWhatsAppNotification(field, fieldAlerts);
-      res.json({
-        ...result,
-        preview: buildWhatsAppMessage(field, fieldAlerts).slice(0, 300),
-      });
+      const spots = await spotsForMessages(field);
+      const result = await sendWhatsAppNotification(field, fieldAlerts, spots);
+      res.json({ ...result, preview: buildWhatsAppMessage(field, fieldAlerts, spots).slice(0, 300) });
     } catch (err) {
       console.error("WhatsApp error:", err);
       res.status(500).json({ error: "WhatsApp notification failed", detail: String(err) });
@@ -1435,11 +1415,11 @@ export function registerRoutes(httpServer: Server, app: Express) {
   // ── Get WhatsApp message preview ────────────────────────────────────────
   app.get("/api/fields/:id/whatsapp-preview", requireAuth, async (req: Request, res: Response) => {
     try {
-      const id = parseInt(req.params.id);
+      const id = parseInt(req.params.id as string);
       const field = storage.getField(id);
       if (!field) return res.status(404).json({ error: "Field not found" });
       const fieldAlerts = storage.getAlertsByField(id);
-      res.json({ message: buildWhatsAppMessage(field, fieldAlerts) });
+      res.json({ message: buildWhatsAppMessage(field, fieldAlerts, await spotsForMessages(field)) });
     } catch (err) {
       res.status(500).json({ error: String(err) });
     }

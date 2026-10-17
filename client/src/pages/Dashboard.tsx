@@ -3,6 +3,7 @@ import { useQuery, useMutation } from "@tanstack/react-query";
 import { queryClient, apiRequest, runAnalyzeJob } from "@/lib/queryClient";
 import type { Field, Alert } from "@shared/schema";
 import { Link } from "wouter";
+import { fieldStatus, STATUS_COLORS } from "@shared/status";
 import { useAuth } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -12,51 +13,10 @@ import { useToast } from "@/hooks/use-toast";
 import {
   SatelliteDish, AlertTriangle, Leaf, Droplets, TrendingUp,
   Plus, RefreshCw, Info, XCircle, Bell, CalendarRange, Trash2,
-  FileText, MessageCircle, Loader2
+  FileText, MessageCircle, Loader2, MapPin
 } from "lucide-react";
 import { RadialBarChart, RadialBar, ResponsiveContainer } from "recharts";
 
-function getNdviLabel(ndvi: number | null) {
-  if (ndvi === null) return { label: "Unanalyzed", color: "bg-muted text-muted-foreground" };
-  if (ndvi >= 0.6) return { label: "Excellent", color: "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400" };
-  if (ndvi >= 0.4) return { label: "Good", color: "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-400" };
-  if (ndvi >= 0.25) return { label: "Moderate", color: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400" };
-  if (ndvi >= 0.1) return { label: "Poor", color: "bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-400" };
-  return { label: "Critical", color: "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400" };
-}
-
-function getWaterLabel(ndwi: number | null) {
-  if (ndwi === null) return "—";
-  // MSI: lower = more moist, higher = more stressed
-  if (ndwi < 0.1) return "Open water (excluded)";
-  if (ndwi < 0.4) return "High moisture";
-  if (ndwi < 0.6) return "Adequate moisture";
-  if (ndwi < 1.0) return "Mild water stress";
-  if (ndwi < 1.2) return "Moderate drought";
-  return "Severe drought";
-}
-
-
-function HealthGauge({ score }: { score: number | null }) {
-  if (score === null) return (
-    <div className="flex items-center justify-center h-24 text-muted-foreground text-xs">Not analyzed</div>
-  );
-  const color = score >= 70 ? "#10b981" : score >= 45 ? "#f59e0b" : "#ef4444";
-  return (
-    <div className="flex flex-col items-center">
-      <ResponsiveContainer width={96} height={96}>
-        <RadialBarChart
-          cx={48} cy={48} innerRadius={28} outerRadius={46}
-          startAngle={225} endAngle={-45} data={[{ value: score, fill: color }]}
-        >
-          <RadialBar dataKey="value" max={100} background={{ fill: "hsl(var(--muted))" }} />
-        </RadialBarChart>
-      </ResponsiveContainer>
-      <p className="text-xl font-bold -mt-8" style={{ color }}>{score}</p>
-      <p className="text-xs text-muted-foreground mt-6">Health Score</p>
-    </div>
-  );
-}
 
 export default function Dashboard() {
   const { toast } = useToast();
@@ -173,9 +133,6 @@ export default function Dashboard() {
   const totalFields = fields.length;
   const analyzedFields = fields.filter(f => f.status !== "pending").length;
   const alertFields = fields.filter(f => f.status === "alert").length;
-  const avgNdvi = fields.filter(f => f.ndvi !== null).length > 0
-    ? (fields.reduce((s, f) => s + (f.ndvi ?? 0), 0) / fields.filter(f => f.ndvi !== null).length).toFixed(3)
-    : "—";
   const unackAlerts = alerts.filter(a => !a.acknowledged).length;
 
   return (
@@ -224,7 +181,7 @@ export default function Dashboard() {
           { label: "Total Fields", value: totalFields, icon: Leaf, color: "text-emerald-600 dark:text-emerald-400" },
           { label: "Analyzed", value: analyzedFields, icon: SatelliteDish, color: "text-primary" },
           { label: "Active Alerts", value: unackAlerts, icon: AlertTriangle, color: unackAlerts > 0 ? "text-red-500" : "text-muted-foreground" },
-          { label: "Avg. NDVI", value: avgNdvi, icon: TrendingUp, color: "text-emerald-600 dark:text-emerald-400" },
+          { label: "Need Action Now", value: fields.filter(f => fieldStatus(f).level === "red").length, icon: TrendingUp, color: "text-red-500" },
         ].map(({ label, value, icon: Icon, color }) => (
           <Card key={label}>
             <CardContent className="p-4">
@@ -265,10 +222,8 @@ export default function Dashboard() {
       ) : (
         <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
           {fields.map(field => {
-            const ndviInfo = getNdviLabel(field.ndvi ?? null);
+            const status = fieldStatus(field);
             const coords = field.coordinates ? JSON.parse(field.coordinates) : [];
-            const waterLabel = getWaterLabel(field.ndwi ?? null);
-            const isWaterPixel = (field.ndwi ?? 1) < 0.1;
             const ts = field.timeSeriesData ? JSON.parse(field.timeSeriesData) : [];
             const validObs = ts.filter((d: any) => !d.excluded && !d.isWater).length;
 
@@ -282,48 +237,44 @@ export default function Dashboard() {
                         {field.region || "Ghana"} · {field.cropType || "Unknown crop"}
                       </p>
                     </div>
-                    <Badge className={`text-xs flex-shrink-0 ${ndviInfo.color}`}>
-                      {ndviInfo.label}
-                    </Badge>
+                    <span
+                      className="text-xs font-semibold flex-shrink-0 flex items-center gap-1.5 px-2 py-0.5 rounded-full text-white"
+                      style={{ background: STATUS_COLORS[status.level] }}
+                      data-testid={`status-${field.id}`}
+                    >
+                      {status.label}
+                    </span>
                   </div>
                 </CardHeader>
                 <CardContent className="space-y-3">
-                  <div className="flex items-center gap-4">
-                    <HealthGauge score={field.healthScore ?? null} />
-                    <div className="flex-1 space-y-2">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs text-muted-foreground flex items-center gap-1">
-                          <Leaf size={11} /> NDVI
-                        </span>
-                        <span className="text-xs font-mono font-medium">
-                          {field.ndvi !== null ? field.ndvi?.toFixed(3) : "—"}
-                        </span>
-                      </div>
-                      <div className="h-1.5 bg-muted rounded-full overflow-hidden">
-                        <div
-                          className="h-full bg-gradient-to-r from-red-500 via-yellow-400 to-emerald-500 rounded-full"
-                          style={{ width: `${Math.max(4, ((field.ndvi ?? 0) / 0.9) * 100)}%` }}
-                        />
-                      </div>
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs text-muted-foreground flex items-center gap-1">
-                          <Droplets size={11} /> MSI
-                        </span>
-                        <span className={`text-xs font-mono font-medium ${isWaterPixel ? "text-blue-500" : ""}`}>
-                          {field.ndwi !== null ? field.ndwi?.toFixed(3) : "—"}
-                        </span>
-                      </div>
-                      <p className={`text-xs ${isWaterPixel ? "text-blue-500" : "text-muted-foreground"}`}>
-                        {waterLabel}
-                      </p>
-                      {validObs > 0 && (
-                        <p className="text-xs text-muted-foreground flex items-center gap-1">
-                          <CalendarRange size={10} />
-                          {validObs} images ≤20% cloud · {field.dateFrom?.slice(0,7)} → {field.dateTo?.slice(0,7)}
-                        </p>
-                      )}
+                  {/* Traffic light + one sentence of action. Numbers live in the Time Series table. */}
+                  <div
+                    className="flex items-start gap-3 rounded-lg p-3"
+                    style={{ background: `${STATUS_COLORS[status.level]}14`, borderLeft: `4px solid ${STATUS_COLORS[status.level]}` }}
+                  >
+                    <span
+                      className="mt-0.5 w-5 h-5 rounded-full flex-shrink-0 shadow-inner"
+                      style={{ background: STATUS_COLORS[status.level] }}
+                      aria-label={status.label}
+                    />
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-foreground">{status.label}</p>
+                      <p className="text-sm text-foreground/80 leading-snug">{status.action}</p>
                     </div>
                   </div>
+                  {(status.level === "red" || status.level === "yellow") && validObs > 0 && (
+                    <Link href={`/maps?field=${field.id}`}>
+                      <Button size="sm" variant="outline" className="w-full gap-1.5 text-xs h-8" data-testid={`button-go-here-${field.id}`}>
+                        <MapPin size={12} /> Go here — see the places to check
+                      </Button>
+                    </Link>
+                  )}
+                  {validObs > 0 && (
+                    <p className="text-xs text-muted-foreground flex items-center gap-1">
+                      <CalendarRange size={10} />
+                      Based on {validObs} satellite images · {field.dateFrom?.slice(0,7)} → {field.dateTo?.slice(0,7)}
+                    </p>
+                  )}
 
                   {coords.length > 0 && (
                     <p className="text-xs text-muted-foreground font-mono truncate">

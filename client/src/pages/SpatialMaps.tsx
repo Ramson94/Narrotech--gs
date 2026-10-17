@@ -10,6 +10,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Map, Layers, Calendar, Info, ZoomIn, Download, Share2, Check, Navigation, MapPin } from "lucide-react";
 import { useToast } from "@/hooks/use-toast";
 import type { Field } from "@shared/schema";
+import { formatArea, spotShareText, walkingDirectionsUrl, type ProblemSpot, type SpotsResult } from "@shared/spots";
 
 // ── Legend component ────────────────────────────────────────────────────────
 function NdviLegend() {
@@ -76,13 +77,20 @@ function ClippedMapImage({
   shape,
   label,
   onClick,
+  spots = [],
 }: {
   imgUrl: string;
   shape: FieldShape;
   label: string;
   onClick: () => void;
+  spots?: ProblemSpot[];
 }) {
   const path = projectShape(shape);
+  const [minLng, minLat, maxLng, maxLat] = shapeBBox(shape, BUF);
+  const pin = (sp: ProblemSpot) => ({
+    x: ((sp.lng - minLng) / (maxLng - minLng)) * 100,
+    y: ((maxLat - sp.lat) / (maxLat - minLat)) * 100,
+  });
 
   return (
     <div
@@ -107,6 +115,16 @@ function ClippedMapImage({
           strokeDasharray="2 1"
           opacity="0.9"
         />
+        {/* Problem spots: lettered pins matching the "Places to check" list */}
+        {spots.map(sp => {
+          const { x, y } = pin(sp);
+          return (
+            <g key={sp.label}>
+              <circle cx={x} cy={y} r="3.4" fill={sp.severity === "critical" ? "#dc2626" : "#d97706"} stroke="white" strokeWidth="0.7" />
+              <text x={x} y={y + 1.3} textAnchor="middle" fontSize="3.6" fontWeight="700" fill="white">{sp.label}</text>
+            </g>
+          );
+        })}
       </svg>
       {/* Zoom hint */}
       <div className="absolute bottom-1.5 right-1.5 bg-black/50 rounded px-1.5 py-0.5 text-white text-[10px] flex items-center gap-1">
@@ -254,6 +272,7 @@ function MapTile({
   label,
   shape,
   fieldName,
+  spots = [],
 }: {
   fieldId: number;
   date: string;
@@ -261,6 +280,7 @@ function MapTile({
   label: string;
   shape: FieldShape;
   fieldName: string;
+  spots?: ProblemSpot[];
 }) {
   const [zoomed, setZoomed] = useState(false);
   const [downloading, setDownloading] = useState(false);
@@ -354,6 +374,7 @@ function MapTile({
             shape={shape}
             label={label}
             onClick={() => setZoomed(true)}
+            spots={spots}
           />
         )}
 
@@ -401,7 +422,7 @@ function MapTile({
             <div className="grid grid-cols-2 gap-4">
               <div>
                 <p className="text-white/60 text-xs mb-1">Clipped to field boundary</p>
-                <ClippedMapImage imgUrl={imgUrl} shape={shape} label={label} onClick={() => {}} />
+                <ClippedMapImage imgUrl={imgUrl} shape={shape} label={label} onClick={() => {}} spots={spots} />
               </div>
               <div>
                 <p className="text-white/60 text-xs mb-1">Full scene context</p>
@@ -420,116 +441,80 @@ function MapTile({
   );
 }
 
-// ── Stress zones panel: navigable GPS pins for the worst sub-areas ──────────
-type StressZone = {
-  id: number;
-  label: string;
-  lat: number;
-  lng: number;
-  value: number;
-  severity: "critical" | "warning" | "moderate";
-  navigateUrl: string;
-  cellCount?: number;
-};
-
-const SEVERITY_STYLES: Record<StressZone["severity"], { badge: string; dot: string; text: string }> = {
-  critical: { badge: "bg-red-100 text-red-700 border-red-200 dark:bg-red-950/40 dark:text-red-400 dark:border-red-900", dot: "bg-red-500", text: "Critical" },
-  warning:  { badge: "bg-amber-100 text-amber-700 border-amber-200 dark:bg-amber-950/40 dark:text-amber-400 dark:border-amber-900", dot: "bg-amber-500", text: "Warning" },
-  moderate: { badge: "bg-blue-100 text-blue-700 border-blue-200 dark:bg-blue-950/40 dark:text-blue-400 dark:border-blue-900", dot: "bg-blue-500", text: "Moderate" },
-};
-
-function StressZonesPanel({
-  fieldId, date, index, indexLabel,
-}: {
-  fieldId: number;
-  date: string;
-  index: "ndvi" | "msi";
-  indexLabel: string;
+// ── "Go here": one list of places to check, matching the pins on the maps ───
+function PlacesToCheck({ fieldName, result, isLoading, error }: {
+  fieldName: string; result?: SpotsResult; isLoading: boolean; error: unknown;
 }) {
-  const { data, isLoading, isError, error } = useQuery<{ zones: StressZone[]; fieldMean?: number; message?: string }>({
-    queryKey: [`/api/fields/${fieldId}/stress-zones`, date, index],
-    queryFn: async () => {
-      const res = await apiRequest("GET", `/api/fields/${fieldId}/stress-zones?date=${date}&index=${index}&maxZones=5`);
-      if (!res.ok) throw new Error("Stress zone analysis failed");
-      return res.json();
-    },
-    staleTime: 24 * 60 * 60 * 1000,
-    retry: 1,
-  });
-
+  const { toast } = useToast();
   if (isLoading) {
     return (
       <div className="space-y-2">
-        <Skeleton className="h-4 w-40" />
-        <Skeleton className="h-16 w-full rounded-lg" />
+        <Skeleton className="h-4 w-48" />
+        <Skeleton className="h-20 w-full rounded-lg" />
       </div>
     );
   }
-
-  if (isError) {
+  if (error) {
+    const msg = error instanceof Error ? error.message : "";
     return (
-      <p className="text-xs text-muted-foreground">
-        Couldn't compute stress zones for this date. {error instanceof Error && error.message.includes("qualifying") ? "Re-run the field analysis to refresh its image dates." : "Try a different observation date."}
+      <p className="text-sm text-muted-foreground">
+        Couldn't find problem spots for this image. {msg.includes("qualifying") ? "Re-run the field analysis to refresh its image dates." : "Try again later."}
+      </p>
+    );
+  }
+  const spots = result?.spots || [];
+  if (spots.length === 0) {
+    return (
+      <p className="text-sm text-emerald-700 dark:text-emerald-400 flex items-center gap-2">
+        <Check size={14} /> {result?.message || "No problem spots — the field looks even on this date."}
       </p>
     );
   }
 
-  const zones = data?.zones || [];
-
-  if (zones.length === 0) {
-    return (
-      <p className="text-xs text-muted-foreground">
-        {data?.message || "No distinct stress zones detected — this field looks uniform for this date."}
-      </p>
-    );
-  }
+  const copy = async (sp: ProblemSpot) => {
+    try {
+      await navigator.clipboard.writeText(`${sp.lat.toFixed(6)}, ${sp.lng.toFixed(6)}`);
+      toast({ title: `Location of spot ${sp.label} copied` });
+    } catch { toast({ title: "Could not copy", variant: "destructive" }); }
+  };
 
   return (
     <div className="space-y-2">
-      <div className="flex items-center gap-1.5">
-        <MapPin size={13} className="text-muted-foreground" />
-        <span className="text-xs font-semibold text-foreground">
-          Worst {indexLabel} zones — tap Navigate to walk there
-        </span>
-      </div>
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
-        {zones.map(zone => {
-          const style = SEVERITY_STYLES[zone.severity];
+      <p className="text-sm font-semibold text-foreground flex items-center gap-2">
+        <MapPin size={15} className="text-red-500" />
+        Go here — {spots.length} place{spots.length > 1 ? "s" : ""} to check
+      </p>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-2">
+        {spots.map(sp => {
+          const color = sp.severity === "critical" ? "#dc2626" : "#d97706";
           return (
-            <div
-              key={zone.id}
-              className="flex items-center justify-between gap-2 rounded-lg border border-border bg-card px-3 py-2"
-              data-testid={`stress-zone-${zone.id}`}
-            >
-              <div className="min-w-0">
-                <div className="flex items-center gap-1.5">
-                  <span className={`inline-block w-2 h-2 rounded-full flex-shrink-0 ${style.dot}`} />
-                  <span className="text-xs font-semibold text-foreground truncate">{zone.label}</span>
-                  <Badge variant="outline" className={`text-[10px] px-1.5 py-0 border ${style.badge}`}>
-                    {style.text}
-                  </Badge>
-                </div>
-                <p className="text-[11px] text-muted-foreground mt-0.5 truncate">
-                  {indexLabel} {zone.value.toFixed(2)} · {zone.lat.toFixed(3)}, {zone.lng.toFixed(3)}
+            <div key={sp.label} className="rounded-lg border border-border bg-card p-3 flex gap-3" data-testid={`spot-${sp.label}`}>
+              <span className="w-8 h-8 rounded-full flex items-center justify-center text-white font-bold flex-shrink-0" style={{ background: color }}>
+                {sp.label}
+              </span>
+              <div className="min-w-0 flex-1 space-y-1">
+                <p className="text-sm font-medium text-foreground leading-snug">{sp.reason}</p>
+                <p className="text-xs text-muted-foreground">Check: {sp.check}</p>
+                <p className="text-xs text-muted-foreground">
+                  About {formatArea(sp.areaHa)}{sp.severity === "critical" ? " · much worse than the rest of the field" : ""}
                 </p>
-                {zone.cellCount && zone.cellCount > 1 ? (
-                  <p className="text-[10px] text-muted-foreground/80 mt-0.5">
-                    Affects ~{zone.cellCount} plots in this patch
+                <div className="flex flex-wrap gap-1.5 pt-1">
+                  <a href={walkingDirectionsUrl(sp.lat, sp.lng)} target="_blank" rel="noopener noreferrer" data-testid={`button-walk-${sp.label}`}>
+                    <Button size="sm" className="h-7 px-2.5 text-xs gap-1"><Navigation size={11} /> Walk there</Button>
+                  </a>
+                  <a href={`https://wa.me/?text=${encodeURIComponent(spotShareText(fieldName, sp))}`} target="_blank" rel="noopener noreferrer">
+                    <Button variant="outline" size="sm" className="h-7 px-2.5 text-xs gap-1"><Share2 size={11} /> Send on WhatsApp</Button>
+                  </a>
+                  <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={() => copy(sp)}>Copy location</Button>
+                </div>
+                {(sp.ndvi !== undefined || sp.msi !== undefined) && (
+                  <p className="text-[10px] text-muted-foreground/70 font-mono pt-0.5">
+                    {sp.ndvi !== undefined && `NDVI ${sp.ndvi.toFixed(2)} (field ${sp.fieldNdvi?.toFixed(2)})`}
+                    {sp.ndvi !== undefined && sp.msi !== undefined && " · "}
+                    {sp.msi !== undefined && `MSI ${sp.msi.toFixed(2)} (field ${sp.fieldMsi?.toFixed(2)})`}
                   </p>
-                ) : null}
+                )}
               </div>
-              <a
-                href={zone.navigateUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex-shrink-0"
-                data-testid={`button-navigate-${zone.id}`}
-              >
-                <Button variant="outline" size="sm" className="h-7 px-2 text-[11px] gap-1">
-                  <Navigation size={11} />
-                  Navigate
-                </Button>
-              </a>
             </div>
           );
         })}
@@ -538,38 +523,61 @@ function StressZonesPanel({
   );
 }
 
-// ── Date window row (one observation date) ──────────────────────────────────
+// ── One satellite image date: places to check first, then the two maps ────────
 function DateRow({
-  fieldId, date, cloudCover, shape, fieldName
+  fieldId, date, cloudCover, shape, fieldName, latest, defaultOpen,
 }: {
   fieldId: number;
   date: string;
   cloudCover?: number | null;
   shape: FieldShape;
   fieldName: string;
+  latest: boolean;
+  defaultOpen: boolean;
 }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const { data, isLoading, error } = useQuery<SpotsResult>({
+    queryKey: [`/api/fields/${fieldId}/spots`, date],
+    queryFn: async () => (await apiRequest("GET", `/api/fields/${fieldId}/spots?date=${date}`)).json(),
+    enabled: open,
+    staleTime: 24 * 60 * 60 * 1000,
+    retry: 1,
+  });
+  const spots = data?.spots || [];
+
   return (
     <div className="space-y-3 border border-border rounded-xl p-4 bg-card">
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2 flex-wrap">
         <Calendar size={14} className="text-muted-foreground" />
         <span className="text-sm font-semibold text-foreground">{date}</span>
+        {latest && <Badge className="text-xs">Latest image</Badge>}
         <Badge variant="outline" className="text-xs">{typeof cloudCover === "number" ? `${cloudCover}% field cloud` : "Sentinel-2 L2A"}</Badge>
+        {!open && (
+          <Button variant="outline" size="sm" className="ml-auto h-7 text-xs" onClick={() => setOpen(true)}>
+            Show maps & places to check
+          </Button>
+        )}
       </div>
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-        <MapTile fieldId={fieldId} date={date} type="ndvi" label="NDVI — Vegetation Index" shape={shape} fieldName={fieldName} />
-        <MapTile fieldId={fieldId} date={date} type="msi"  label="MSI — Moisture Stress"   shape={shape} fieldName={fieldName} />
-      </div>
-      <div className="pt-3 border-t border-border space-y-4">
-        <StressZonesPanel fieldId={fieldId} date={date} index="ndvi" indexLabel="NDVI" />
-        <StressZonesPanel fieldId={fieldId} date={date} index="msi" indexLabel="MSI" />
-      </div>
+      {open && (
+        <>
+          <PlacesToCheck fieldName={fieldName} result={data} isLoading={isLoading} error={error} />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 pt-3 border-t border-border">
+            <MapTile fieldId={fieldId} date={date} type="ndvi" label="NDVI — Vegetation Index" shape={shape} fieldName={fieldName} spots={spots} />
+            <MapTile fieldId={fieldId} date={date} type="msi"  label="MSI — Moisture Stress"   shape={shape} fieldName={fieldName} spots={spots} />
+          </div>
+        </>
+      )}
     </div>
   );
 }
 
 // ── Main page ───────────────────────────────────────────────────────────────
 export default function SpatialMaps() {
-  const [selectedFieldId, setSelectedFieldId] = useState<string>("");
+  const [selectedFieldId, setSelectedFieldId] = useState<string>(
+    // Opened from a dashboard "Go here" link: /maps?field=ID (the router keeps the query in location.search)
+    () => new URLSearchParams(window.location.search).get("field")
+      || new URLSearchParams(window.location.hash.split("?")[1] || "").get("field") || ""
+  );
 
   const { data: fields = [], isLoading: fieldsLoading } = useQuery<Field[]>({
     queryKey: ["/api/fields"],
@@ -585,7 +593,7 @@ export default function SpatialMaps() {
     ? (JSON.parse(selectedField.timeSeriesData) as any[])
         .filter(d => !d.excluded && d.ndvi !== null)
         .map(d => ({ date: d.date as string, cloudCover: typeof d.cloudCover === "number" ? d.cloudCover : null }))
-        .sort((a, b) => a.date.localeCompare(b.date))
+        .sort((a, b) => b.date.localeCompare(a.date)) // newest first
     : [];
   const obsDates = observations.map(o => o.date);
 
@@ -599,7 +607,8 @@ export default function SpatialMaps() {
             Spatial Maps
           </h2>
           <p className="text-sm text-muted-foreground mt-0.5">
-            NDVI and MSI maps from the Sentinel-2 images used in the time series (20% or less cloud over the field).
+            Where to go in your field: places to check with walking directions, and NDVI and MSI maps
+            from the Sentinel-2 images used in the time series (20% or less cloud over the field). Newest image first.
             Download or share any map as a PNG image.
           </p>
         </div>
@@ -625,7 +634,7 @@ export default function SpatialMaps() {
               <SelectContent>
                 {analyzedFields.map(f => (
                   <SelectItem key={f.id} value={String(f.id)}>
-                    {f.name} — {f.region}
+                    {f.name}{f.region ? ` — ${f.region}` : ""}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -656,9 +665,11 @@ export default function SpatialMaps() {
               {" "}Use the <strong className="text-foreground">PNG</strong> or <strong className="text-foreground">Share</strong> buttons on each map to export or send directly.
             </p>
           </div>
-          {observations.map(({ date, cloudCover }) => (
+          {observations.map(({ date, cloudCover }, i) => (
             <DateRow
-              key={date}
+              key={`${selectedField.id}-${date}`}
+              latest={i === 0}
+              defaultOpen={i === 0}
               fieldId={selectedField.id}
               date={date}
               cloudCover={cloudCover}
