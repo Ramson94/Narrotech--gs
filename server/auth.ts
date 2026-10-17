@@ -2,6 +2,19 @@ import type { Express } from "express";
 import bcrypt from "bcryptjs";
 import { storage } from "./storage";
 import { insertUserSchema } from "@shared/schema";
+import { ADMIN_ONLY, LOGIN_MAX_FAILED, LOGIN_WINDOW_MS } from "./access";
+
+// In-memory failed-login tracker (single server instance), keyed by email and by client address.
+const failedLogins = new Map<string, number[]>();
+function recentFailures(key: string): number {
+  const cutoff = Date.now() - LOGIN_WINDOW_MS;
+  const list = (failedLogins.get(key) || []).filter(t => t > cutoff);
+  failedLogins.set(key, list);
+  return list.length;
+}
+function recordFailure(...keys: string[]) {
+  for (const k of keys) failedLogins.set(k, [...(failedLogins.get(k) || []), Date.now()]);
+}
 
 export function registerAuthRoutes(app: Express) {
   // POST /api/auth/register
@@ -12,13 +25,12 @@ export function registerAuthRoutes(app: Express) {
   // they want to onboard) by calling this same endpoint while logged in.
   app.post("/api/auth/register", async (req, res) => {
     try {
-      const isFirst = storage.countUsers() === 0;
-
-      if (!isFirst) {
-        const requester = req.session?.userId ? storage.getUserById(req.session.userId) : undefined;
-        if (!requester || requester.role !== "admin") {
-          return res.status(403).json({ error: "Public registration is disabled. Contact the administrator for access." });
-        }
+      // Sign-up is never public. The administrator account is created at start-up (see storage.ts);
+      // only a signed-in administrator can create further accounts.
+      const isFirst = false;
+      const requester = req.session?.userId ? storage.getUserById(req.session.userId) : undefined;
+      if (!requester || requester.role !== "admin") {
+        return res.status(403).json({ error: "Public registration is disabled. Contact the administrator for access." });
       }
 
       const { name, email, password, role } = insertUserSchema.parse(req.body);
@@ -52,11 +64,22 @@ export function registerAuthRoutes(app: Express) {
       const { email, password } = req.body as { email: string; password: string };
       if (!email || !password) return res.status(400).json({ error: "Email and password required" });
 
-      const user = storage.getUserByEmail(email);
-      if (!user) return res.status(401).json({ error: "Invalid email or password" });
+      const emailKey = `email:${String(email).toLowerCase()}`;
+      const ipKey = `ip:${req.ip}`;
+      if (recentFailures(emailKey) >= LOGIN_MAX_FAILED || recentFailures(ipKey) >= LOGIN_MAX_FAILED * 4) {
+        return res.status(429).json({ error: "Too many failed sign-in attempts. Please wait 15 minutes and try again." });
+      }
 
-      const valid = await bcrypt.compare(password, user.passwordHash);
-      if (!valid) return res.status(401).json({ error: "Invalid email or password" });
+      const user = storage.getUserByEmail(email);
+      const valid = user ? await bcrypt.compare(password, user.passwordHash) : false;
+      if (!user || !valid) {
+        recordFailure(emailKey, ipKey);
+        return res.status(401).json({ error: "Invalid email or password" });
+      }
+      if (ADMIN_ONLY && user.role !== "admin") {
+        return res.status(403).json({ error: "Access is currently limited to the administrator." });
+      }
+      failedLogins.delete(emailKey);
 
       req.session.userId = user.id;
       res.json({ id: user.id, name: user.name, email: user.email, role: user.role });
@@ -78,6 +101,7 @@ export function registerAuthRoutes(app: Express) {
     if (!req.session?.userId) return res.status(401).json({ error: "Not logged in" });
     const user = storage.getUserById(req.session.userId);
     if (!user) return res.status(401).json({ error: "User not found" });
+    if (ADMIN_ONLY && user.role !== "admin") return res.status(403).json({ error: "Access is currently limited to the administrator." });
     res.json({ id: user.id, name: user.name, email: user.email, role: user.role });
   });
 }

@@ -6,6 +6,8 @@
  */
 import PDFDocument from "pdfkit";
 import type { Field, Alert } from "@shared/schema";
+import { fieldStatus, STATUS_COLORS } from "@shared/status";
+import { formatArea, walkingDirectionsUrl, type ProblemSpot } from "@shared/spots";
 
 // ── Colour palette ──────────────────────────────────────────────────────────
 const C = {
@@ -49,18 +51,6 @@ function healthColor(score: number | null): string {
   if (score >= 70) return C.green;
   if (score >= 45) return C.yellow;
   return C.red;
-}
-
-function recommendation(field: Field): string {
-  const ndvi = field.ndvi ?? 0;
-  const msi  = field.ndwi ?? 0;
-  if (msi > 1.2)  return "⚠ URGENT: Severe drought stress detected. Irrigate immediately if possible. Consider emergency water application.";
-  if (msi > 1.0)  return "Moderate drought stress. Schedule irrigation within 3–5 days. Monitor daily.";
-  if (ndvi < 0.2) return "Very low vegetation density. Inspect field for crop failure, pest damage, or soil issues.";
-  if (ndvi < 0.35) return "Low vegetation health. Consider fertiliser application and check for disease or pest pressure.";
-  if (ndvi >= 0.6 && msi < 0.6) return "Optimal crop health. Maintain current management practices.";
-  if (ndvi >= 0.4)return "Good crop health. Continue routine monitoring every 2 weeks.";
-  return "Moderate crop health. Monitor closely and ensure adequate soil moisture.";
 }
 
 // ── Bar drawing helper ───────────────────────────────────────────────────────
@@ -149,7 +139,8 @@ function drawSparkline(
 // ── Main PDF builder ─────────────────────────────────────────────────────────
 export function generateFieldReport(
   field: Field,
-  fieldAlerts: Alert[]
+  fieldAlerts: Alert[],
+  spots: ProblemSpot[] = []
 ): Promise<Buffer> {
   const doc = new (PDFDocument as any)({ size: "A4", margin: 0, info: {
     Title: `NarrowTech GS — Crop Health Report: ${field.name}`,
@@ -195,7 +186,7 @@ export function generateFieldReport(
   const meta: string[] = [];
   if (field.region) meta.push(`Region: ${field.region.replace(/-/g, " ").replace(/\b\w/g, c => c.toUpperCase())}`);
   if (field.cropType) meta.push(`Crop: ${field.cropType.charAt(0).toUpperCase() + field.cropType.slice(1)}`);
-  if (field.dateFrom && field.dateTo) meta.push(`Analysis period: ${field.dateFrom} → ${field.dateTo}`);
+  if (field.dateFrom && field.dateTo) meta.push(`Analysis period: ${field.dateFrom} to ${field.dateTo}`);
   if (field.analyzedAt) meta.push(`Last analyzed: ${new Date(field.analyzedAt).toLocaleDateString("en-GB")}`);
 
   doc.fontSize(9).fillColor(C.muted).font("Helvetica")
@@ -206,6 +197,52 @@ export function generateFieldReport(
   doc.moveTo(MARGIN, curY).lineTo(PAGE_W - MARGIN, curY)
     .strokeColor(C.border).lineWidth(1).stroke();
   curY += 14;
+
+  // Start a new page when the next block would run off this one.
+  const ensureSpace = (h: number) => {
+    if (curY + h > PAGE_H - 50) { doc.addPage({ size: "A4", margin: 0 }); curY = 40; }
+  };
+
+  // ── Status: traffic light + what to do ─────────────────────────────────────
+  const status = fieldStatus(field);
+  const sColor = STATUS_COLORS[status.level];
+  const statusH = 58;
+  doc.rect(MARGIN, curY, CONTENT_W, statusH).fillColor(sColor).fillOpacity(0.08).fill().fillOpacity(1);
+  doc.rect(MARGIN, curY, 5, statusH).fillColor(sColor).fill();
+  doc.circle(MARGIN + 30, curY + statusH / 2, 13).fillColor(sColor).fill();
+  doc.fontSize(15).fillColor(sColor).font("Helvetica-Bold")
+    .text(status.label.toUpperCase(), MARGIN + 54, curY + 11, { width: CONTENT_W - 64 });
+  doc.fontSize(10.5).fillColor(C.dark).font("Helvetica")
+    .text(status.action, MARGIN + 54, curY + 31, { width: CONTENT_W - 64 });
+  curY += statusH + 14;
+
+  // ── Places to go ───────────────────────────────────────────────────────────
+  if (spots.length > 0) {
+    doc.fontSize(10).fillColor(C.dark).font("Helvetica-Bold")
+      .text(`Go here: ${spots.length} place${spots.length > 1 ? "s" : ""} to check`, MARGIN, curY);
+    curY += 16;
+    for (const sp of spots) {
+      ensureSpace(48);
+      const spColor = sp.severity === "critical" ? C.red : C.orange;
+      doc.rect(MARGIN, curY, CONTENT_W, 44).fillColor(C.light).fill();
+      doc.circle(MARGIN + 16, curY + 22, 10).fillColor(spColor).fill();
+      doc.fontSize(11).fillColor(C.white).font("Helvetica-Bold").text(sp.label, MARGIN + 9, curY + 16, { width: 14, align: "center" });
+      doc.fontSize(9).fillColor(C.dark).font("Helvetica-Bold")
+        .text(`${sp.reason} (about ${formatArea(sp.areaHa)})`, MARGIN + 34, curY + 5, { width: CONTENT_W - 44 });
+      doc.fontSize(8).fillColor(C.mid).font("Helvetica")
+        .text(`Check: ${sp.check}`, MARGIN + 34, curY + 18, { width: CONTENT_W - 44 });
+      doc.fontSize(8).fillColor(C.blue)
+        .text(`${sp.lat.toFixed(6)}, ${sp.lng.toFixed(6)}  ·  Open walking directions`, MARGIN + 34, curY + 30,
+          { width: CONTENT_W - 44, link: walkingDirectionsUrl(sp.lat, sp.lng), underline: true });
+      curY += 48;
+    }
+    curY += 8;
+  }
+
+  // ── Technical values ───────────────────────────────────────────────────────
+  ensureSpace(90);
+  doc.fontSize(8).fillColor(C.muted).font("Helvetica-Bold").text("TECHNICAL VALUES (latest satellite image)", MARGIN, curY);
+  curY += 12;
 
   // ── KPI cards row ────────────────────────────────────────────────────────
   const kpiW = (CONTENT_W - 10) / 3;
@@ -253,23 +290,7 @@ export function generateFieldReport(
 
   curY += kpiH + 16;
 
-  // ── Recommendation box ────────────────────────────────────────────────────
-  const recText = recommendation(field);
-  const isCritical = recText.startsWith("⚠");
-  const recBg = isCritical ? "#fff7ed" : "#f0fdf4";
-  const recBorder = isCritical ? C.orange : C.green;
-  const recHeight = 46;
-
-  doc.rect(MARGIN, curY, CONTENT_W, recHeight).fillColor(recBg).fill();
-  doc.rect(MARGIN, curY, 3, recHeight).fillColor(recBorder).fill();
-  doc.rect(MARGIN, curY, CONTENT_W, recHeight).strokeColor(recBorder).lineWidth(0.5).stroke();
-
-  doc.fontSize(8).fillColor(C.mid).font("Helvetica-Bold")
-    .text("RECOMMENDATION", MARGIN + 10, curY + 8);
-  doc.font("Helvetica").fontSize(8.5).fillColor(C.dark)
-    .text(recText.replace(/^⚠ URGENT: /, ""), MARGIN + 10, curY + 20, { width: CONTENT_W - 20 });
-  curY += recHeight + 16;
-
+  ensureSpace(40);
   // ── NDVI reference bar ────────────────────────────────────────────────────
   doc.fontSize(9).fillColor(C.dark).font("Helvetica-Bold")
     .text("NDVI — Vegetation Health", MARGIN, curY);
@@ -287,6 +308,7 @@ export function generateFieldReport(
   }
   curY += 30;
 
+  ensureSpace(40);
   // ── MSI reference bar ─────────────────────────────────────────────────────
   doc.fontSize(9).fillColor(C.dark).font("Helvetica-Bold")
     .text("MSI — Moisture Stress Index", MARGIN, curY);
@@ -304,6 +326,7 @@ export function generateFieldReport(
   }
   curY += 30;
 
+  ensureSpace(160);
   // ── Time series chart ─────────────────────────────────────────────────────
   if (field.timeSeriesData) {
     const ts: any[] = JSON.parse(field.timeSeriesData);
@@ -328,6 +351,7 @@ export function generateFieldReport(
     curY = legY + 18;
   }
 
+  ensureSpace(60);
   // ── Alerts ────────────────────────────────────────────────────────────────
   const activeAlerts = fieldAlerts.filter(a => !a.acknowledged);
   if (activeAlerts.length > 0) {
@@ -418,7 +442,7 @@ export function generateFieldReport(
 
   const methodology = [
     "Satellite: ESA Sentinel-2 Level-2A (10m resolution) via Copernicus Data Space",
-    "NDVI = (B08 − B04) / (B08 + B04) · Range −1 to 1; healthy vegetation typically 0.4–0.8",
+    "NDVI = (B08 - B04) / (B08 + B04) · Range -1 to 1; healthy vegetation typically 0.4–0.8",
     "MSI = B11 / B8A (SWIR/NIR) · Increases with water stress; open water pixels (MSI < 0.1) excluded",
     "Observation cadence: one image per 14-day window (the clearest image with 20% or less cloud over the field; if none, the nearest such image up to 7 days outside the window)",
     "Cloud filter: measured over the field itself; cloud, cirrus and cloud shadow count as cloud and are masked from all averages and maps",
