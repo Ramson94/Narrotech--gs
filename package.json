@@ -2,6 +2,9 @@
   "name": "rest-express",
   "version": "1.0.0",
   "license": "MIT",
+  "engines": {
+    "node": ">=22.23.4 <23"
+  },
   "type": "module",
   "scripts": {
     "dev": "NODE_ENV=development tsx server/index.ts",
